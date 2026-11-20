@@ -1,6 +1,0 @@
-95e0637 (HEAD -> refreshEventsCache, origin/refreshEventsCache) more pipeline fixes
-c1e9a7b pytest fix
-a427a34 python linting
-3475046 fixing pipeline issues
-4d46d8d Add refresh events button, SharePoint API proxy, and event caching updates
-a0143ba updated some stuff for getting around OIDC and Created DoDWarningDialog component
