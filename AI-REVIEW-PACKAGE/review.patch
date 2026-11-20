@@ -1,0 +1,4495 @@
+diff --git a/backend/python/.env.example b/backend/python/.env.example
+index 4d0f041..9d6bf29 100644
+--- a/backend/python/.env.example
++++ b/backend/python/.env.example
+@@ -1,79 +1,86 @@
+ # ── Required ───────────────────────────────────────────────────────────────────
+ DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/combined_calendar
+ 
+ # ── Auth / OIDC ────────────────────────────────────────────────────────────────
+ OIDC_AUTHORITY=https://appauth-api.qa.svc/
+ OIDC_AUDIENCE=combinedcalendarapi
+ # TODO(SOCEUR): replace with SOCEUR issuer values.
+ VALID_ISSUERS=["https://TODO-appauth-qa.soceur.mil/","https://appauth-api.qa.svc/"]
+ 
+ # ── CORS ───────────────────────────────────────────────────────────────────────
+ # JSON array of allowed origins. Leave empty to disable CORS middleware.
+ # TODO(SOCEUR): replace with SOCEUR CORS origins.
+ CORS_URLS=["https://TODO-cals-qa.soceur.mil","https://TODO-appauth-qa.soceur.mil"]
+ 
+ # ── App ────────────────────────────────────────────────────────────────────────
+ ENVIRONMENT=development
+ LOG_LEVEL=INFO
+ 
+ # Set true to return synthetic event details from DevMockProvider on /api/eventdetails only.
+ # Intended for local or isolated environments without provider credentials or network access.
+ # Development and staging use mocks by default. Set to true to force-enable in any environment.
+ PROVIDERS_MOCK_ENABLED=false
+ # Override environments that should auto-enable mock providers.
+ PROVIDERS_MOCK_ENVIRONMENTS=["development","staging"]
+ 
+ # When true, API auth can be bypassed and a mock admin user is injected.
+ # Development and staging allow this by default.
+ AUTH_BYPASS_ENABLED=false
+ AUTH_BYPASS_ENVIRONMENTS=["development","staging"]
+ 
+ # ── Email ──────────────────────────────────────────────────────────────────────
+ # TODO(SOCEUR): replace with SOCEUR SMTP host.
+ SMTP_HOST=TODO-SMTP-HOST.SOCEUR.Local
+ SMTP_PORT=25
+ # TODO(SOCEUR): replace with SOCEUR sender address.
+ SMTP_FROM=Patch-SOCEUR-ISKM-Developers@soceur.local
+ SMTP_ENABLED=false
+ 
+ # ── Uvicorn ────────────────────────────────────────────────────────────────────
+ UVICORN_WORKERS=4
+ UVICORN_HOST=0.0.0.0
+ UVICORN_PORT=8000
+ UVICORN_TIMEOUT_KEEP_ALIVE=120
+ 
+ # ── TLS (leave empty when TLS is terminated upstream by IIS ARR / F5) ─────────
+ SSL_CERTFILE=
+ SSL_KEYFILE=
+ 
+ # ── Database pool ──────────────────────────────────────────────────────────────
+ DB_POOL_SIZE=10
+ DB_MAX_OVERFLOW=20
+ DB_POOL_TIMEOUT=30
+ 
+ # ── Certificates ───────────────────────────────────────────────────────────────
+ # Fallback directory for file-based certs. Primary source is LocalMachine\My.
+ CERTS_DIR=C:\ProgramData\SlateApi\certs
+ 
++# ── SharePoint API proxy (sp-api-proxy) ────────────────────────────────────────
++# Root URL of the sp-api-proxy service (its PROXY_PORT + PROXY_ROOT). A SharePoint
++# provider whose URL equals this value is read through the proxy; set the
++# source's "List URL" to the SharePoint list title. Leave empty to disable.
++SP_API_PROXY_URL=http://localhost:3033/sp-api
++SP_API_PROXY_TIMEOUT_SECONDS=30
++
+ # ── PDF export ─────────────────────────────────────────────────────────────────
+ PDF_ENABLED=true
+ 
+ # ── Event detail cache ─────────────────────────────────────────────────────────
+ EVENT_DETAIL_CACHE_ENABLED=true
+ EVENT_DETAIL_CACHE_SECONDS=30
+ EVENT_DETAIL_CACHE_MAX_ENTRIES=1000
+ 
+ # ── In-process caches (auth tokens + event details) ────────────────────────────
+ TOKEN_CACHE_MAX_ENTRIES=200
+ CACHE_SWEEP_INTERVAL_SECONDS=300
+ 
+ # ── Data transfer ──────────────────────────────────────────────────────────────
+ DATATRANSFER_ENABLED=true
+ 
+ # ── User identity ──────────────────────────────────────────────────────────────
+ # Use "org_chart" to fetch identity from ORCA or "local" to read identity fields
+ # from the users table.
+ USER_IDENTITY_SOURCE=org_chart
+ # Base URL of the ORCA backend when USER_IDENTITY_SOURCE=org_chart.
+ # TODO(SOCEUR): replace with the deployed ORCA API base URL.
+ ORG_CHART_API_URL=http://localhost:8001
+diff --git a/backend/python/app/api/v1/routers/event_details.py b/backend/python/app/api/v1/routers/event_details.py
+index 8a2f91f..a4a8ba7 100644
+--- a/backend/python/app/api/v1/routers/event_details.py
++++ b/backend/python/app/api/v1/routers/event_details.py
+@@ -1,46 +1,49 @@
+ """EventDetails router — aggregates events from all configured providers."""
+ 
+ from datetime import UTC, datetime
+ 
+ from fastapi import APIRouter, Depends, HTTPException, Query
+ 
+ from app.core.config import settings
+ from app.core.dependencies import require_any_user
+ from app.providers.base import EventDetail
+ from app.services.event_details import get_event_details
+ 
+ router = APIRouter(prefix="/api/eventdetails", tags=["event-details"])
+ 
+ 
+ @router.get("", response_model=list[EventDetail])
+ async def fetch_event_details(
+     source_ids: list[str] = Query(default=[]),
+     start: str | None = Query(default=None),
+     end: str | None = Query(default=None),
++    # User-requested reload: skip cached events and re-query the providers.
++    refresh: bool = Query(default=False),
+     _auth=Depends(require_any_user),
+ ):
+     if not source_ids:
+         return []
+ 
+     try:
+         start_dt = (
+             datetime.fromisoformat(start)
+             if start
+             else datetime.now(UTC).replace(hour=0, minute=0, second=0)
+         )
+         end_dt = (
+             datetime.fromisoformat(end)
+             if end
+             else datetime.now(UTC).replace(hour=23, minute=59, second=59)
+         )
+     except ValueError as exc:
+         raise HTTPException(
+             status_code=400, detail=f"Invalid date format: {exc}"
+         ) from exc
+ 
+     return await get_event_details(
+         source_ids,
+         start_dt,
+         end_dt,
+         use_mock_providers=settings.should_use_mock_providers,
++        force_refresh=refresh,
+     )
+diff --git a/backend/python/app/core/auth.py b/backend/python/app/core/auth.py
+index e391a49..dec15fd 100644
+--- a/backend/python/app/core/auth.py
++++ b/backend/python/app/core/auth.py
+@@ -1,88 +1,96 @@
+ """
+ JWT / OIDC authentication.
+ 
+ Validates Bearer tokens against the configured OIDC authority, caches JWKS at
+ startup, and supports multiple valid issuers.
+ 
+ Claim mapping from the existing token shape
+   sub       → CurrentUser.sub  (also used as client_id for service-to-service)
+   userId    → CurrentUser.user_id  (UUID of the DB user record)
+   roles     → CurrentUser.roles
+   edipi     → CurrentUser.edipi (10-digit DoD ID, present on CAC-authenticated tokens)
+   email     → CurrentUser.email
+   firstName → CurrentUser.first_name
+   lastName  → CurrentUser.last_name
+ """
+ 
+ from __future__ import annotations
+ 
+ import contextvars
+-from typing import Any
++from datetime import UTC, datetime
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from sqlalchemy.ext.asyncio import AsyncSession
++
++    from app.models.user import User
+ 
+ import httpx
+ import structlog
+-from fastapi import Depends, HTTPException
++from fastapi import Depends, HTTPException, Request
+ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+ from jose import JWTError, jwt
+ from jose.exceptions import ExpiredSignatureError
+ from pydantic import BaseModel
++from sqlalchemy import select
++from sqlalchemy.orm import selectinload
+ 
+ from app.core.config import settings
+ from app.mock_data.store import DEV_MOCK_USER_ID
+ 
+ log = structlog.get_logger()
+ 
+ # Populated at startup by fetch_jwks(); used by every token validation call.
+ _jwks_cache: dict[str, Any] = {}
+ 
+ # Request-scoped context variable so get_db() can issue SET LOCAL without
+ # receiving CurrentUser as an explicit argument.
+ current_user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+     "current_user_id", default=None
+ )
+ 
+ _bearer = HTTPBearer(auto_error=False)
+ 
+ 
+ # ── Startup helper ─────────────────────────────────────────────────────────────
+ 
+ 
+ async def fetch_jwks() -> None:
+     """Fetch and cache the JWKS from the OIDC authority's well-known endpoint.
+ 
+     Called once at application startup via the lifespan context.
+     Skipped gracefully when OIDC_AUTHORITY is not configured (local dev).
+     """
+     global _jwks_cache
+ 
+     if not settings.oidc_authority:
+         log.warning(
+             "oidc_authority_not_set",
+             msg="JWT validation disabled — set OIDC_AUTHORITY for production",
+         )
+         return
+ 
+     url = settings.oidc_authority.rstrip("/") + "/.well-known/jwks"
+     try:
+         async with httpx.AsyncClient(verify=True, timeout=10) as client:
+             resp = await client.get(url)
+             resp.raise_for_status()
+             _jwks_cache = resp.json()
+             log.info("jwks_loaded", url=url, key_count=len(_jwks_cache.get("keys", [])))
+     except Exception as exc:
+         if settings.environment == "development":
+             log.warning("jwks_fetch_skipped_for_development", url=url, error=str(exc))
+             return
+         log.error("jwks_fetch_failed", url=url, error=str(exc))
+         raise
+ 
+ 
+ # ── Token model ────────────────────────────────────────────────────────────────
+ 
+ 
+ class CurrentUser(BaseModel):
+     sub: str
+     user_id: str | None = None
+     roles: list[str] = []
+     edipi: str | None = None
+     email: str | None = None
+@@ -105,92 +113,188 @@ def _mock_current_user() -> CurrentUser:
+     current_user_id_var.set(user.sub)
+     structlog.contextvars.bind_contextvars(user_sub=user.sub)
+     return user
+ 
+ 
+ # ── Validation ─────────────────────────────────────────────────────────────────
+ 
+ 
+ def _decode_token(token: str) -> dict[str, Any]:
+     """Validate signature, expiry, audience, and issuer; return the raw payload."""
+     if not _jwks_cache:
+         # OIDC not configured — allow all requests in development only.
+         if settings.environment == "development":
+             try:
+                 return jwt.get_unverified_claims(token)
+             except JWTError:
+                 pass
+         raise HTTPException(status_code=401, detail="JWKS not loaded")
+ 
+     valid_issuers = settings.valid_issuers or (
+         [settings.oidc_authority] if settings.oidc_authority else []
+     )
+ 
+     if not valid_issuers:
+         log.error(
+             "no_valid_issuers_configured", msg="Set OIDC_AUTHORITY or VALID_ISSUERS"
+         )
+         raise HTTPException(
+             status_code=401,
+             detail="Server misconfiguration: no valid issuers configured",
+         )
+ 
+     last_error: Exception | None = None
+     for issuer in valid_issuers:
+         try:
+             payload = jwt.decode(
+                 token,
+                 _jwks_cache,
+                 algorithms=["RS256"],
+                 audience=settings.oidc_audience,
+                 issuer=issuer,
+                 options={"verify_at_hash": False},
+             )
+             return payload
+         except ExpiredSignatureError:
+             raise HTTPException(status_code=401, detail="Token expired") from None
+         except JWTError as exc:
+             last_error = exc
+ 
+     raise HTTPException(status_code=401, detail=f"Invalid token: {last_error}")
+ 
+ 
+ def _extract_roles(payload: dict[str, Any]) -> list[str]:
+     """Normalise the roles claim — may be a string or a list."""
+     raw = payload.get("roles", payload.get("role", []))
+     if isinstance(raw, str):
+         return [raw]
+     return list(raw)
+ 
+ 
++# ── Windows-proxy auth ────────────────────────────────────────────────────────
++
++
++async def _find_user_by_username(session: AsyncSession, username: str) -> User | None:
++    from app.models.user import User, UserRole
++
++    result = await session.scalars(
++        select(User)
++        .where(User.username == username)
++        .options(selectinload(User.roles).selectinload(UserRole.role))
++    )
++    return result.first()
++
++
++async def _user_from_header(username: str) -> CurrentUser:
++    """Find or create a user by their CAC username; assign User role on first login.
++
++    Uses a single commit for the happy path. If two requests race on a brand-new
++    user, the second INSERT raises IntegrityError; we roll back and re-fetch so
++    both requests succeed without error.
++    """
++    from sqlalchemy.exc import IntegrityError
++
++    from app.constants import SYSTEM_USER_ID
++    from app.core.dependencies import RoleNames
++    from app.db.session import AsyncSessionLocal
++    from app.models.role import Role
++    from app.models.user import User, UserRole
++
++    async with AsyncSessionLocal() as session:
++        now = datetime.now(UTC)
++
++        user = await _find_user_by_username(session, username)
++
++        if user is None:
++            try:
++                user = User(
++                    username=username,
++                    is_active=True,
++                    created_time=now,
++                    created_by=SYSTEM_USER_ID,
++                )
++                session.add(user)
++                await session.flush()  # populate user.id before referencing it
++
++                default_role = await session.scalar(
++                    select(Role).where(Role.name == RoleNames.USER)
++                )
++                if default_role is not None:
++                    session.add(
++                        UserRole(
++                            user_id=user.id,
++                            role_id=default_role.id,
++                            created_time=now,
++                            created_by=user.id,
++                            modified_time=now,
++                            modified_by=user.id,
++                        )
++                    )
++                    await session.flush()
++
++            except IntegrityError as exc:
++                # Concurrent request created this user between our SELECT and INSERT.
++                await session.rollback()
++                user = await _find_user_by_username(session, username)
++                if user is None:
++                    raise HTTPException(
++                        status_code=500, detail="Failed to resolve user"
++                    ) from exc
++
++        user.last_logged_in = now
++        user.modified_time = now
++        user.modified_by = user.id
++        await session.commit()
++        await session.refresh(user, ["roles"])
++
++        roles = [ur.role.name for ur in user.roles if ur.role]
++        current_user = CurrentUser(
++            sub=username,
++            user_id=str(user.id),
++            roles=roles,
++        )
++
++    current_user_id_var.set(str(user.id))
++    structlog.contextvars.bind_contextvars(user_sub=username)
++    return current_user
++
++
+ # ── FastAPI dependency ─────────────────────────────────────────────────────────
+ 
+ 
+ async def get_current_user(
++    request: Request,
+     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+ ) -> CurrentUser:
+-    """Validate the Bearer token and return the authenticated user.
++    """Return the authenticated user.
+ 
+-    Also writes `sub` into the request-scoped context variable so that
+-    get_db() can issue ``SET LOCAL app.current_user_id`` without requiring
+-    CurrentUser to be threaded through every service call.
++    With AUTH_SOURCE=windows_proxy: reads X-Remote-User (CAC CN set by nginx),
++    finds or creates the DB record, and returns it — no token involved.
++
++    With AUTH_SOURCE=jwt (default): validates the Bearer token against OIDC JWKS.
+     """
++    if settings.auth_source == "windows_proxy":
++        username = request.headers.get("x-remote-user", "").strip()
++        if not username:
++            raise HTTPException(status_code=401, detail="Not authenticated")
++        return await _user_from_header(username)
++
+     if credentials is None:
+         if settings.should_bypass_auth:
+             return _mock_current_user()
+         raise HTTPException(status_code=401, detail="Not authenticated")
+ 
+     payload = _decode_token(credentials.credentials)
+ 
+     user = CurrentUser(
+         sub=payload["sub"],
+         user_id=payload.get("userId"),
+         roles=_extract_roles(payload),
+         edipi=payload.get("edipi"),
+         email=payload.get("email"),
+         first_name=payload.get("firstName"),
+         last_name=payload.get("lastName"),
+     )
+ 
+     current_user_id_var.set(user.sub)
+     structlog.contextvars.bind_contextvars(user_sub=user.sub)
+     return user
+diff --git a/backend/python/app/core/config.py b/backend/python/app/core/config.py
+index 5554229..a4c0bec 100644
+--- a/backend/python/app/core/config.py
++++ b/backend/python/app/core/config.py
+@@ -90,84 +90,95 @@ class Settings(BaseSettings):
+         "pif",
+         "pol",
+         "ppkg",
+         "ps1xml",
+         "ps2",
+         "ps2xml",
+         "psc1",
+         "psc2",
+         "rar",
+         "reg",
+         "resources",
+         "resx",
+         "scf",
+         "scr",
+         "sln",
+         "tar",
+         "tmp",
+         "vb",
+         "vbe",
+         "vhd",
+         "vhdx",
+         "ws",
+         "wsc",
+         "wsf",
+         "wsh",
+         "z",
+     ]
+ 
+     # PDF
+     pdf_enabled: bool = True
+     pdf_additional_styles: list[str] = [
+         ".b-sch-event { background-image: none !important; }",
+         ".b-sch-label-before, .b-sch-label-after { color: black !important; }",
+         ".b-sch-label, .b-sch-event-content { font-weight: 500 !important; }",
+     ]
+ 
+     # Uvicorn / TLS
+     # Leave ssl_certfile/ssl_keyfile empty to skip TLS (use IIS ARR in front).
+     uvicorn_workers: int = 4
+     uvicorn_timeout_keep_alive: int = 120
+     ssl_certfile: str = ""
+     ssl_keyfile: str = ""
+ 
+     # Event detail cache
+     event_detail_cache_enabled: bool = True
+     event_detail_cache_seconds: int = 30
+     # Hard cap on distinct (resource, date-window) entries; oldest evicted on overflow.
+     event_detail_cache_max_entries: int = 1000
+ 
+     # OAuth bearer token cache — hard cap on distinct cache keys (one per provider/client).
+     token_cache_max_entries: int = 200
+ 
+     # In-process cache sweep — periodic active eviction of expired entries so
+     # long-running workers don't accumulate stale keys between reads.
+     cache_sweep_interval_seconds: int = 300  # 5 minutes
+ 
+     # Org-chart (ORCA) personnel API — source of truth for user identity
+     org_chart_api_url: str = ""
+     user_identity_source: Literal["org_chart", "local"] = "org_chart"
+ 
++    # Authentication source: "jwt" (OIDC Bearer tokens) or "windows_proxy"
++    # (trusted X-Remote-User header injected by nginx from the CAC cert CN).
++    auth_source: str = "jwt"
++
+     # Provider certificates — Windows cert store (LocalMachine\My) is the primary
+     # source; certs_dir is used as a fallback for file-based certs if needed.
+     certs_dir: str = r"C:\ProgramData\SlateApi\certs"
+ 
++    # sp-api-proxy — Node service that reads SharePoint lists with an NTLM
++    # service account. A SharePoint provider whose URL equals this value is
++    # read through the proxy instead of calling SharePoint REST directly.
++    # Example: http://localhost:3033/sp-api
++    sp_api_proxy_url: str = ""
++    sp_api_proxy_timeout_seconds: int = 30
++
+     @property
+     def should_use_mock_providers(self) -> bool:
+         env = self.environment.strip().lower()
+         default_mock_envs = {
+             item.strip().lower() for item in self.providers_mock_environments
+         }
+         return self.providers_mock_enabled or env in default_mock_envs
+ 
+     @property
+     def should_bypass_auth(self) -> bool:
+         env = self.environment.strip().lower()
+         bypass_envs = {item.strip().lower() for item in self.auth_bypass_environments}
+         return self.auth_bypass_enabled or env in bypass_envs
+ 
+     @property
+     def should_use_local_user_identity(self) -> bool:
+         return self.user_identity_source == "local"
+ 
+ 
+ settings = Settings()
+diff --git a/backend/python/app/models/user.py b/backend/python/app/models/user.py
+index 620b330..f2a693f 100644
+--- a/backend/python/app/models/user.py
++++ b/backend/python/app/models/user.py
+@@ -1,65 +1,66 @@
+ import uuid
+ from datetime import datetime
+ from typing import TYPE_CHECKING
+ 
+ from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint
+ from sqlalchemy.dialects.postgresql import UUID
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.models.base import AuditableEntity
+ 
+ if TYPE_CHECKING:
+     from app.models.role import Role
+ 
+ 
+ class User(AuditableEntity):
+     __tablename__ = "users"
+     __table_args__ = (
+         UniqueConstraint("edipi", name="uq_users_edipi"),
+         Index("ix_users_is_active", "is_active", postgresql_where="is_active = true"),
+     )
+ 
+-    edipi: Mapped[str] = mapped_column(String(10), nullable=False)
++    edipi: Mapped[str | None] = mapped_column(String(10), nullable=True)
++    username: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+     first_name: Mapped[str | None] = mapped_column(String, nullable=True)
+     last_name: Mapped[str | None] = mapped_column(String, nullable=True)
+     middle_name: Mapped[str | None] = mapped_column(String(1), nullable=True)
+     email: Mapped[str | None] = mapped_column(String, nullable=True)
+     last_logged_in: Mapped[datetime | None] = mapped_column(
+         DateTime(timezone=True), nullable=True
+     )
+ 
+     roles: Mapped[list["UserRole"]] = relationship(
+         "UserRole", back_populates="user", cascade="all, delete-orphan"
+     )
+     profile_properties: Mapped[list["UserProfileProperty"]] = relationship(
+         "UserProfileProperty", back_populates="user", cascade="all, delete-orphan"
+     )
+ 
+ 
+ class UserRole(AuditableEntity):
+     __tablename__ = "user_roles"
+     __table_args__ = (
+         UniqueConstraint("user_id", "role_id", name="uq_user_roles_user_role"),
+     )
+ 
+     user_id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+     )
+     role_id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False
+     )
+ 
+     user: Mapped["User"] = relationship("User", back_populates="roles")
+     role: Mapped["Role"] = relationship("Role", back_populates="user_roles")
+ 
+ 
+ class UserProfileProperty(AuditableEntity):
+     __tablename__ = "user_profile_properties"
+ 
+     user_id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+     )
+     key: Mapped[str] = mapped_column(String, nullable=False)
+     value: Mapped[str] = mapped_column(String, nullable=False)
+ 
+     user: Mapped["User"] = relationship("User", back_populates="profile_properties")
+diff --git a/backend/python/app/providers/base.py b/backend/python/app/providers/base.py
+index 62e5610..27edd38 100644
+--- a/backend/python/app/providers/base.py
++++ b/backend/python/app/providers/base.py
+@@ -1,59 +1,61 @@
+ """Provider protocol and shared value objects."""
+ 
+ from __future__ import annotations
+ 
+ from datetime import datetime
+ from typing import Protocol, runtime_checkable
+ 
+ from pydantic import BaseModel
+ 
+ from app.schemas.base import _OrmBase
+ 
+ 
+ class EventDetailArgs(BaseModel):
+     """Input arguments passed to every provider.GetEvents() call."""
+ 
+     resource_id: str
+     source_name: str
+     start: datetime
+     end: datetime
+     # Source properties dict (EventSource.properties JSONB)
+     source_properties: dict = {}
+     # Provider properties dict (EventProvider.properties JSONB)
+     provider_properties: dict = {}
++    # True when the user asked for fresh data; providers must bypass their caches.
++    force_refresh: bool = False
+ 
+ 
+ class EventDetail(_OrmBase):
+     id: str
+     name: str
+     source_name: str
+     start_dtime: datetime | None = None
+     end_dtime: datetime | None = None
+     description: str | None = None
+     url: str | None = None
+     is_all_day: bool = False
+     resource_id: str | None = None
+     properties: dict | None = None
+ 
+ 
+ @runtime_checkable
+ class IProvider(Protocol):
+     provider_type_name: str
+ 
+     async def get_events(self, args: EventDetailArgs) -> list[EventDetail]: ...
+ 
+     async def get_source_fields(
+         self, provider_properties: dict, source_properties: dict
+     ) -> list[str]:
+         """Return field names available from the data source."""
+         return []
+ 
+     async def test_source(
+         self, provider_properties: dict, source_properties: dict
+     ) -> dict:
+         """Test connectivity and return {success: bool, message: str}."""
+         return {"success": False, "message": "Not implemented"}
+ 
+     async def get_status(self, provider_properties: dict) -> str:
+         """Return 'ok', 'degraded', or 'error'."""
+         return "unknown"
+diff --git a/backend/python/app/providers/cache.py b/backend/python/app/providers/cache.py
+index 28d0676..83215eb 100644
+--- a/backend/python/app/providers/cache.py
++++ b/backend/python/app/providers/cache.py
+@@ -1,76 +1,91 @@
+ """
+ In-process event detail cache with configurable TTL.
+ 
+ Cache key: {resource_id}:{start_dtime_short}:{end_dtime_short}
+ Only caches non-empty results.
+ 
+ Bounded via two complementary mechanisms so a long-running worker never
+ accumulates stale entries indefinitely:
+ - Hard cap on put(): once event_detail_cache_max_entries is reached, the
+   oldest entry (OrderedDict insertion/access order) is evicted first.
+ - Active sweep(): scheduled periodically (see app/tasks/cache_sweep.py) to
+   drop expired entries even if their key is never read again.
+ """
+ 
+ from __future__ import annotations
+ 
+ from collections import OrderedDict
+ from datetime import UTC, datetime, timedelta
+ 
+ from app.core.config import settings
+ from app.providers.base import EventDetail
+ 
+ _store: OrderedDict[str, tuple[list[EventDetail], datetime]] = OrderedDict()
+ 
+ 
+ def _key(resource_id: str, start: datetime, end: datetime) -> str:
+     return f"{resource_id}:{start.strftime('%Y%m%d')}:{end.strftime('%Y%m%d')}"
+ 
+ 
+ def get(resource_id: str, start: datetime, end: datetime) -> list[EventDetail] | None:
+     if not settings.event_detail_cache_enabled:
+         return None
+     k = _key(resource_id, start, end)
+     entry = _store.get(k)
+     if entry is None:
+         return None
+     events, expires_at = entry
+     if datetime.now(UTC) > expires_at:
+         del _store[k]
+         return None
+     _store.move_to_end(k)
+     return events
+ 
+ 
++def ttl_seconds(provider_properties: dict | None) -> int:
++    """Cache lifetime for a provider: its `cacheExpireSeconds` admin setting,
++    falling back to the global default when unset or invalid."""
++    raw = (provider_properties or {}).get("cacheExpireSeconds")
++    try:
++        ttl = int(raw)
++    except (TypeError, ValueError):
++        ttl = 0
++    return ttl if ttl > 0 else settings.event_detail_cache_seconds
++
++
+ def put(
+-    resource_id: str, start: datetime, end: datetime, events: list[EventDetail]
++    resource_id: str,
++    start: datetime,
++    end: datetime,
++    events: list[EventDetail],
++    ttl: int | None = None,
+ ) -> None:
+     if not settings.event_detail_cache_enabled or not events:
+         return
+     k = _key(resource_id, start, end)
+     expires_at = datetime.now(UTC) + timedelta(
+-        seconds=settings.event_detail_cache_seconds
++        seconds=ttl if ttl is not None else settings.event_detail_cache_seconds
+     )
+     _store[k] = (events, expires_at)
+     _store.move_to_end(k)
+ 
+     max_entries = settings.event_detail_cache_max_entries
+     while len(_store) > max_entries:
+         _store.popitem(last=False)
+ 
+ 
+ def sweep() -> int:
+     """Remove all expired entries. Returns the number of entries evicted.
+ 
+     Runs on a periodic schedule so date-range windows that are never
+     re-read (e.g. past dates) don't linger in memory until process restart.
+     """
+     now = datetime.now(UTC)
+     expired_keys = [k for k, (_, expires_at) in _store.items() if now > expires_at]
+     for k in expired_keys:
+         del _store[k]
+     return len(expired_keys)
+ 
+ 
+ def clear() -> None:
+     _store.clear()
+diff --git a/backend/python/app/providers/sharepoint.py b/backend/python/app/providers/sharepoint.py
+index dc18140..a0de4f7 100644
+--- a/backend/python/app/providers/sharepoint.py
++++ b/backend/python/app/providers/sharepoint.py
+@@ -1,159 +1,233 @@
+ """
+ SharePoint / Senior Leader Tracker provider.
+ 
+ Uses SharePoint REST API (/_api/web/lists) with certificate-based auth.
+ 
++When the provider URL equals settings.sp_api_proxy_url, lists are read through
++sp-api-proxy instead (see app/providers/sp_api_proxy.py); the source `url` is
++then the SharePoint list *title*.
++
+ Provider properties consumed: url, certificateThumbprint
+ Source properties consumed:   url, isView, titleFieldName, startDtimeFieldName,
+                               endDtimeFieldName, miscFields, filter
+ """
+ 
+ from __future__ import annotations
+ 
+ import uuid
+ 
+ import httpx
+ import structlog
+ 
+ from app.core.constants import EventProviderTypeNames
++from app.providers import cache as event_cache
++from app.providers import sp_api_proxy
+ from app.providers.base import EventDetail, EventDetailArgs
+ from app.providers.filter_service import apply_filter
+ from app.providers.utils import parse_event_date
+ 
+ log = structlog.get_logger()
+ 
+ 
+ class SharePointProvider:
+     provider_type_name = EventProviderTypeNames.SHARE_POINT
+ 
+     async def get_events(self, args: EventDetailArgs) -> list[EventDetail]:
+         pp = args.provider_properties
+         sp = args.source_properties
+ 
+         site_url: str = pp.get("url", "")
+         thumbprint: str = pp.get("certificateThumbprint", "")
+         list_url: str = sp.get("url", "")
+         title_field: str = sp.get("titleFieldName", "Title")
+         start_field: str = sp.get("startDtimeFieldName", "EventDate")
+         end_field: str = sp.get("endDtimeFieldName", "EndDate")
+         filter_json: str | None = sp.get("filter")
+ 
+         if not site_url or not list_url:
+             return []
+ 
++        if sp_api_proxy.is_proxy_url(site_url):
++            return await self._get_events_via_proxy(
++                args, site_url, list_url, title_field, start_field, end_field
++            )
++
+         from app.providers.auth import httpx_cert_for_thumbprint
+ 
+         cert = httpx_cert_for_thumbprint(thumbprint) if thumbprint else None
+ 
+         # Build filter for date range
+         caml_filter = (
+             f"EventDate ge datetime'{args.start.isoformat()}' and "
+             f"EndDate le datetime'{args.end.isoformat()}'"
+         )
+         endpoint = (
+             f"{site_url.rstrip('/')}/_api/web/lists/getbyurl('{list_url}')/items"
+             f"?$filter={caml_filter}&$top=1000"
+         )
+ 
+         try:
+             async with httpx.AsyncClient(
+                 cert=cert, verify=False if not cert else True
+             ) as client:
+                 resp = await client.get(
+                     endpoint,
+                     headers={"Accept": "application/json;odata=verbose"},
+                     timeout=30,
+                 )
+                 resp.raise_for_status()
+                 items = resp.json().get("d", {}).get("results", [])
+         except Exception as exc:
+             from app.core.exceptions import SharePointException
+ 
+             raise SharePointException(f"SharePoint fetch failed: {exc}") from exc
+ 
+         raw = [dict(item) for item in items]
+         filtered = apply_filter(raw, filter_json)
+ 
+         events: list[EventDetail] = []
+         for item in filtered:
+             events.append(
+                 EventDetail(
+                     id=str(uuid.uuid4()),
+                     name=str(item.get(title_field, "")),
+                     source_name=args.source_name,
+                     start_dtime=parse_event_date(item.get(start_field)),
+                     end_dtime=parse_event_date(item.get(end_field)),
+                     description=item.get("Description"),
+                     url=f"{site_url.rstrip('/')}/lists/{list_url}/{item.get('Id', '')}",
+                     is_all_day=bool(item.get("fAllDayEvent", False)),
+                     resource_id=args.resource_id,
+                     properties=dict(item),
+                 )
+             )
+         return events
+ 
++    async def _get_events_via_proxy(
++        self,
++        args: EventDetailArgs,
++        proxy_url: str,
++        list_title: str,
++        title_field: str,
++        start_field: str,
++        end_field: str,
++    ) -> list[EventDetail]:
++        """Read the list through sp-api-proxy; `list_title` is the list's title.
++
++        The proxy returns whole lists with no query options, so the date
++        window is applied here rather than in the SharePoint request.
++        """
++        try:
++            items = await sp_api_proxy.fetch_list_items(
++                proxy_url,
++                list_title,
++                ttl_seconds=event_cache.ttl_seconds(args.provider_properties),
++                force_refresh=args.force_refresh,
++            )
++        except Exception as exc:
++            from app.core.exceptions import SharePointException
++
++            raise SharePointException(
++                f"SharePoint proxy fetch failed for list '{list_title}': {exc}"
++            ) from exc
++
++        in_window = [
++            item
++            for item in items
++            if sp_api_proxy.overlaps_window(
++                item, start_field, end_field, args.start, args.end
++            )
++        ]
++        filtered = apply_filter(in_window, args.source_properties.get("filter"))
++
++        return [
++            EventDetail(
++                id=str(uuid.uuid4()),
++                name=str(item.get(title_field) or ""),
++                source_name=args.source_name,
++                start_dtime=parse_event_date(item.get(start_field)),
++                end_dtime=parse_event_date(item.get(end_field)),
++                description=item.get("Description"),
++                is_all_day=bool(item.get("fAllDayEvent", False)),
++                resource_id=args.resource_id,
++                properties=dict(item),
++            )
++            for item in filtered
++        ]
++
+     async def get_source_fields(
+         self, provider_properties: dict, source_properties: dict
+     ) -> list[str]:
+         pp = provider_properties
+         sp = source_properties
+         site_url = pp.get("url", "")
+         list_url = sp.get("url", "")
+         thumbprint = pp.get("certificateThumbprint", "")
+         if not site_url or not list_url:
+             return []
+ 
++        if sp_api_proxy.is_proxy_url(site_url):
++            # The proxy has no fields endpoint; infer columns from the rows.
++            try:
++                items = await sp_api_proxy.fetch_list_items(site_url, list_url)
++            except Exception as exc:
++                log.warning("sp_proxy_fields_failed", list=list_url, error=str(exc))
++                return []
++            return sp_api_proxy.field_names(items)
++
+         from app.providers.auth import httpx_cert_for_thumbprint
+ 
+         cert = httpx_cert_for_thumbprint(thumbprint) if thumbprint else None
+         endpoint = f"{site_url.rstrip('/')}/_api/web/lists/getbyurl('{list_url}')/fields?$select=InternalName,TypeAsString&$filter=Hidden eq false"
+         try:
+             async with httpx.AsyncClient(
+                 cert=cert, verify=False if not cert else True
+             ) as client:
+                 resp = await client.get(
+                     endpoint,
+                     headers={"Accept": "application/json;odata=verbose"},
+                     timeout=15,
+                 )
+                 resp.raise_for_status()
+                 fields = resp.json().get("d", {}).get("results", [])
+                 return [f["InternalName"] for f in fields]
+         except Exception:
+             return []
+ 
+     async def test_source(
+         self, provider_properties: dict, source_properties: dict
+     ) -> dict:
+         try:
+             fields = await self.get_source_fields(
+                 provider_properties, source_properties
+             )
+             return {"success": bool(fields), "message": f"Found {len(fields)} fields"}
+         except Exception as exc:
+             return {"success": False, "message": str(exc)}
+ 
+     async def get_status(self, provider_properties: dict) -> str:
+         try:
+             site_url = provider_properties.get("url", "")
++            if sp_api_proxy.is_proxy_url(site_url):
++                return "ok" if await sp_api_proxy.is_healthy(site_url) else "degraded"
+             thumbprint = provider_properties.get("certificateThumbprint", "")
+             from app.providers.auth import httpx_cert_for_thumbprint
+ 
+             cert = httpx_cert_for_thumbprint(thumbprint) if thumbprint else None
+             async with httpx.AsyncClient(
+                 cert=cert, verify=False if not cert else True
+             ) as client:
+                 resp = await client.get(
+                     f"{site_url.rstrip('/')}/_api/web",
+                     headers={"Accept": "application/json"},
+                     timeout=10,
+                 )
+             return "ok" if resp.is_success else "degraded"
+         except Exception:
+             return "error"
+ 
+ 
+ class SeniorLeaderTrackerProvider(SharePointProvider):
+     """Shares the SharePoint REST implementation; only the provider type name differs."""
+ 
+     provider_type_name = EventProviderTypeNames.SENIOR_LEADER_TRACKER
+diff --git a/backend/python/app/providers/sp_api_proxy.py b/backend/python/app/providers/sp_api_proxy.py
+new file mode 100644
+index 0000000..dc6954e
+--- /dev/null
++++ b/backend/python/app/providers/sp_api_proxy.py
+@@ -0,0 +1,179 @@
++"""
++Client for sp-api-proxy — the Node service that reads SharePoint lists with an
++NTLM service account on SLATE's behalf.
++
++The proxy is bound to a single SharePoint site (its SP_SITE_URL) and exposes:
++
++    GET {root}/list-items/{listTitle}   → raw SharePoint REST payload
++    GET {root}/health                   → {"status": "ok"}
++
++It takes no query options, so date-range and field filtering happen here, and
++whole lists are cached in-process so calendar navigation does not re-download
++them.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from collections import OrderedDict
++from datetime import UTC, datetime, timedelta
++from urllib.parse import quote
++
++import httpx
++
++from app.core.config import settings
++from app.providers.utils import parse_event_date
++
++# OData bookkeeping keys that are not list columns.
++_METADATA_PREFIXES = ("odata.", "@odata.", "__")
++
++
++def _normalize(url: str) -> str:
++    return url.strip().rstrip("/").lower()
++
++
++def is_proxy_url(provider_url: str) -> bool:
++    """True when a provider's URL points at the configured sp-api-proxy."""
++    proxy_url = _normalize(settings.sp_api_proxy_url)
++    return bool(proxy_url) and _normalize(provider_url) == proxy_url
++
++
++def extract_items(payload: object) -> list[dict]:
++    """Pull list rows out of a SharePoint REST payload.
++
++    Handles the default shape ({"value": [...]}), odata=verbose
++    ({"d": {"results": [...]}}), and a bare array.
++    """
++    rows: object = payload
++    if isinstance(payload, dict):
++        if isinstance(payload.get("value"), list):
++            rows = payload["value"]
++        elif isinstance(payload.get("d"), dict):
++            rows = payload["d"].get("results", [])
++        else:
++            rows = []
++    if not isinstance(rows, list):
++        return []
++    return [dict(row) for row in rows if isinstance(row, dict)]
++
++
++def field_names(items: list[dict]) -> list[str]:
++    """Column names seen across the rows, in first-seen order."""
++    names: dict[str, None] = {}
++    for item in items:
++        for key in item:
++            if not key.startswith(_METADATA_PREFIXES):
++                names.setdefault(key, None)
++    return list(names)
++
++
++def overlaps_window(
++    item: dict,
++    start_field: str,
++    end_field: str,
++    window_start: datetime,
++    window_end: datetime,
++) -> bool:
++    """True when the row's [start, end] range intersects the requested window.
++
++    Rows with no parseable start date are dropped; a missing end date is
++    treated as a point-in-time event at the start.
++    """
++    item_start = parse_event_date(item.get(start_field))
++    if item_start is None:
++        return False
++    item_end = parse_event_date(item.get(end_field)) or item_start
++    win_start = parse_event_date(window_start)
++    win_end = parse_event_date(window_end)
++    return item_start <= win_end and item_end >= win_start
++
++
++# ── Whole-list cache ───────────────────────────────────────────────────────────
++# The proxy always returns the entire list, so one cached copy serves every
++# date window the calendar asks for. key → (rows, expires_at)
++_LIST_CACHE_MAX_ENTRIES = 200
++_list_cache: OrderedDict[str, tuple[list[dict], datetime]] = OrderedDict()
++_list_locks: dict[str, asyncio.Lock] = {}
++
++
++def _cached_rows(key: str) -> list[dict] | None:
++    entry = _list_cache.get(key)
++    if entry is None:
++        return None
++    rows, expires_at = entry
++    if datetime.now(UTC) > expires_at:
++        del _list_cache[key]
++        return None
++    _list_cache.move_to_end(key)
++    return rows
++
++
++async def fetch_list_items(
++    proxy_url: str,
++    list_title: str,
++    *,
++    ttl_seconds: int = 0,
++    force_refresh: bool = False,
++) -> list[dict]:
++    """Return every row of a SharePoint list, via the proxy.
++
++    Rows are cached for `ttl_seconds` (0 disables caching). `force_refresh`
++    skips the cached copy and replaces it. Callers must not mutate the rows.
++    """
++    use_cache = settings.event_detail_cache_enabled and ttl_seconds > 0
++    key = f"{_normalize(proxy_url)}|{list_title}"
++
++    if use_cache and not force_refresh:
++        rows = _cached_rows(key)
++        if rows is not None:
++            return rows
++
++    # One fetch per list at a time: concurrent callers wait and share the result.
++    lock = _list_locks.setdefault(key, asyncio.Lock())
++    waited = lock.locked()
++    async with lock:
++        if use_cache and (waited or not force_refresh):
++            rows = _cached_rows(key)
++            if rows is not None:
++                return rows
++
++        endpoint = f"{proxy_url.rstrip('/')}/list-items/{quote(list_title, safe='')}"
++        async with httpx.AsyncClient() as client:
++            resp = await client.get(
++                endpoint,
++                headers={"Accept": "application/json"},
++                timeout=settings.sp_api_proxy_timeout_seconds,
++            )
++            resp.raise_for_status()
++            rows = extract_items(resp.json())
++
++        if use_cache:
++            _list_cache[key] = (
++                rows,
++                datetime.now(UTC) + timedelta(seconds=ttl_seconds),
++            )
++            _list_cache.move_to_end(key)
++            while len(_list_cache) > _LIST_CACHE_MAX_ENTRIES:
++                _list_cache.popitem(last=False)
++        return rows
++
++
++def sweep_lists() -> int:
++    """Remove expired cached lists. Returns the number of entries evicted."""
++    now = datetime.now(UTC)
++    expired = [k for k, (_, expires_at) in _list_cache.items() if now > expires_at]
++    for k in expired:
++        del _list_cache[k]
++        _list_locks.pop(k, None)
++    return len(expired)
++
++
++def clear_list_cache() -> None:
++    _list_cache.clear()
++    _list_locks.clear()
++
++
++async def is_healthy(proxy_url: str) -> bool:
++    async with httpx.AsyncClient() as client:
++        resp = await client.get(f"{proxy_url.rstrip('/')}/health", timeout=10)
++    return resp.is_success and resp.json().get("status") == "ok"
+diff --git a/backend/python/app/services/event_details.py b/backend/python/app/services/event_details.py
+index ddeae1e..469e3a0 100644
+--- a/backend/python/app/services/event_details.py
++++ b/backend/python/app/services/event_details.py
+@@ -1,176 +1,199 @@
+ """Aggregate events from all requested sources, with caching."""
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+ import uuid
+ from datetime import UTC, datetime
+ 
+ import structlog
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.providers import cache as event_cache
+ from app.providers.base import EventDetail, EventDetailArgs
+ from app.providers.factory import get_provider
+ 
+ log = structlog.get_logger()
+ 
+ 
+ def _provider_for_type(provider_type_name: str, *, use_mock_providers: bool):
+     if use_mock_providers:
+         from app.providers.dev_mock import DevMockProvider
+ 
+         return DevMockProvider(provider_type_name)
+     return get_provider(provider_type_name)
+ 
+ 
+ async def _fetch_source(
+     source_id: uuid.UUID,
+     start: datetime,
+     end: datetime,
+     *,
+     use_mock_providers: bool = False,
++    force_refresh: bool = False,
+ ) -> list[EventDetail]:
+     """Fetch events for a single EventSource with its own DB session.
+ 
++    Results are cached for the provider's `cacheExpireSeconds`; `force_refresh`
++    skips the cached copy and replaces it with a fresh fetch.
++
++
+     Each call opens a dedicated session so concurrent gather() calls do not
+     share SQLAlchemy state — async sessions are not safe for concurrent use.
+     """
+     from sqlalchemy import select
+ 
+     from app.db.session import AsyncSessionLocal
+     from app.models.event import EventProvider, EventProviderType, EventSource
+ 
+     async with AsyncSessionLocal() as db:
+         result = await db.execute(
+             select(EventSource, EventProvider, EventProviderType)
+             .join(EventProvider, EventSource.event_provider_id == EventProvider.id)
+             .join(
+                 EventProviderType,
+                 EventProvider.event_provider_type_id == EventProviderType.id,
+             )
+             .where(EventSource.id == source_id, EventSource.is_active.is_(True))
+         )
+         row = result.first()
+         if not row:
+             return []
+ 
+         source, provider, provider_type = row
+ 
+     resource_id = str(source_id)
+-    cached = event_cache.get(resource_id, start, end)
+-    if cached is not None:
+-        return cached
++    if not force_refresh:
++        cached = event_cache.get(resource_id, start, end)
++        if cached is not None:
++            return cached
+ 
+     args = EventDetailArgs(
+         resource_id=resource_id,
+         source_name=source.name,
+         start=start,
+         end=end,
+         source_properties=source.properties or {},
+         provider_properties=provider.properties or {},
++        force_refresh=force_refresh,
+     )
+ 
+     try:
+         prov = _provider_for_type(
+             provider_type.name, use_mock_providers=use_mock_providers
+         )
+         events = await prov.get_events(args)
+-        event_cache.put(resource_id, start, end, events)
++        event_cache.put(
++            resource_id,
++            start,
++            end,
++            events,
++            ttl=event_cache.ttl_seconds(provider.properties),
++        )
+         return events
+     except Exception as exc:
+         log.warning("provider_fetch_error", source_id=str(source_id), error=str(exc))
+         return []
+ 
+ 
+ _FETCH_CONCURRENCY = 10
+ _fetch_semaphore = asyncio.Semaphore(_FETCH_CONCURRENCY)
+ 
+ 
+ async def _fetch_source_limited(
+     source_id: uuid.UUID,
+     start: datetime,
+     end: datetime,
+     *,
+     use_mock_providers: bool = False,
++    force_refresh: bool = False,
+ ) -> list[EventDetail]:
+     async with _fetch_semaphore:
+         return await _fetch_source(
+-            source_id, start, end, use_mock_providers=use_mock_providers
++            source_id,
++            start,
++            end,
++            use_mock_providers=use_mock_providers,
++            force_refresh=force_refresh,
+         )
+ 
+ 
+ async def get_event_details(
+     source_ids: list[str],
+     start: datetime,
+     end: datetime,
+     *,
+     use_mock_providers: bool = False,
++    force_refresh: bool = False,
+ ) -> list[EventDetail]:
+     """Fetch and merge events from multiple sources concurrently."""
+     if not source_ids:
+         return []
+ 
+     tasks = [
+         _fetch_source_limited(
+-            uuid.UUID(sid), start, end, use_mock_providers=use_mock_providers
++            uuid.UUID(sid),
++            start,
++            end,
++            use_mock_providers=use_mock_providers,
++            force_refresh=force_refresh,
+         )
+         for sid in source_ids
+     ]
+     results = await asyncio.gather(*tasks, return_exceptions=True)
+ 
+     events: list[EventDetail] = []
+     for result in results:
+         if isinstance(result, list):
+             events.extend(result)
+         else:
+             log.warning("provider_gather_error", error=str(result))
+ 
+     return events
+ 
+ 
+ async def get_provider_status(db: AsyncSession) -> list[dict]:
+     """Return provider status in the same shape as C# GetAllWithStatusAsync."""
+     from datetime import datetime
+ 
+     from sqlalchemy import select
+     from sqlalchemy.orm import selectinload
+ 
+     from app.models.event import EventProvider
+ 
+     result = await db.execute(
+         select(EventProvider)
+         .options(
+             selectinload(EventProvider.provider_type),
+             selectinload(EventProvider.sources),
+             selectinload(EventProvider.templates),
+         )
+         .order_by(EventProvider.name)
+     )
+     providers = result.scalars().all()
+ 
+     statuses = []
+     for provider in providers:
+         sources = list(provider.sources or [])
+         is_online = False
+         event_sources_online = 0
+         try:
+             prov = get_provider(provider.provider_type.name)
+             status = await prov.get_status(provider.properties or {})
+             is_online = status == "ok" or status is True
+             if is_online:
+                 # C# checks each source URL with the provider cert. Python providers
+                 # do not expose that shared certificate probe, so active URL-bearing
+                 # sources are counted when the provider itself is online.
+                 event_sources_online = sum(
+                     1
+                     for source in sources
+                     if source.is_active and (source.properties or {}).get("url")
+                 )
+         except Exception:
+             is_online = False
+         statuses.append(
+             {
+                 "id": str(provider.id),
+                 "name": provider.name,
+                 "is_active": provider.is_active,
+diff --git a/backend/python/app/services/users.py b/backend/python/app/services/users.py
+index 275fe1a..81c4743 100644
+--- a/backend/python/app/services/users.py
++++ b/backend/python/app/services/users.py
+@@ -30,121 +30,127 @@ from app.schemas.user import validate_edipi
+ from app.services.base import CRUDService
+ 
+ _USER_AGREEMENT_KEY = "user-agreement"
+ 
+ user_service: CRUDService[User] = CRUDService(User)
+ user_role_service: CRUDService[UserRole] = CRUDService(UserRole)
+ profile_service: CRUDService[UserProfileProperty] = CRUDService(UserProfileProperty)
+ 
+ 
+ # ── Helpers ────────────────────────────────────────────────────────────────────
+ 
+ 
+ @dataclass(frozen=True)
+ class UserIdentity:
+     edipi: str
+     first_name: str
+     last_name: str
+     middle_name: str | None
+     email: str | None
+     full_name: str
+ 
+ 
+ def _build_user_read(user: User, identity: UserIdentity) -> dict:
+     """Merge a slate User record with identity data into a UserRead dict."""
+     return {
+         "id": user.id,
+         "edipi": user.edipi,
+         "first_name": identity.first_name,
+         "last_name": identity.last_name,
+         "middle_name": identity.middle_name,
+         "email": identity.email,
+         "last_logged_in": user.last_logged_in,
+         "is_active": user.is_active,
+         "created_time": user.created_time,
+         "created_by": user.created_by,
+         "modified_time": user.modified_time,
+         "modified_by": user.modified_by,
+     }
+ 
+ 
+ def _split_full_name(full_name: str) -> tuple[str, str]:
+     parts = full_name.split(" ", 1)
+     return parts[0], parts[1] if len(parts) > 1 else ""
+ 
+ 
+ def _identity_from_org_chart(person: OrgChartPersonnel) -> UserIdentity:
+     first_name, last_name = _split_full_name(person.full_name)
+     return UserIdentity(
+         edipi=person.edipi,
+         first_name=first_name,
+         last_name=last_name,
+         middle_name=None,
+         email=person.sipr_email,
+         full_name=person.full_name,
+     )
+ 
+ 
+ def _identity_from_local_user(user: User) -> UserIdentity:
+     first_name = user.first_name or ""
+     last_name = user.last_name or ""
+-    full_name = f"{first_name} {last_name}".strip() or user.email or user.edipi
++    full_name = (
++        f"{first_name} {last_name}".strip()
++        or user.email
++        or user.username
++        or user.edipi
++        or ""
++    )
+     return UserIdentity(
+         edipi=user.edipi,
+         first_name=first_name,
+         last_name=last_name,
+         middle_name=user.middle_name,
+         email=user.email,
+         full_name=full_name,
+     )
+ 
+ 
+ # ── Identity adapters ──────────────────────────────────────────────────────────
+ 
+ 
+ @runtime_checkable
+ class UserIdentityAdapter(Protocol):
+     """Common interface for local-DB and org-chart identity sources."""
+ 
+     allows_roleless_reactivation: bool
+ 
+     async def get_identity(
+         self, db: AsyncSession, edipi: str, *, caller_edipi: str
+     ) -> UserIdentity | None: ...
+ 
+     async def query_users(
+         self,
+         db: AsyncSession,
+         *,
+         active_only: bool,
+         filter: str | None,
+         skip: int | None = None,
+         take: int | None = None,
+         caller_edipi: str = "",
+     ) -> tuple[list[dict], int]: ...
+ 
+ 
+ class LocalIdentityAdapter:
+     """Identity sourced from the local users table."""
+ 
+     allows_roleless_reactivation = True
+ 
+     async def get_identity(
+         self, db: AsyncSession, edipi: str, *, caller_edipi: str
+     ) -> UserIdentity | None:
+         user = await get_user_by_edipi(db, edipi)
+         if user is None:
+             return None
+         return _identity_from_local_user(user)
+ 
+     async def query_users(
+         self,
+         db: AsyncSession,
+         *,
+         active_only: bool,
+         filter: str | None,
+         skip: int | None = None,
+         take: int | None = None,
+         caller_edipi: str = "",
+     ) -> tuple[list[dict], int]:
+         """SQL-level filtering and optional pagination.
+ 
+@@ -242,121 +248,123 @@ def _identity_adapter() -> UserIdentityAdapter:
+ 
+ async def _require_identity(
+     db: AsyncSession, edipi: str, *, caller_edipi: str
+ ) -> UserIdentity:
+     """Fetch identity from the configured source; raises NotFoundException if absent."""
+     identity = await _get_identity(db, edipi, caller_edipi=caller_edipi)
+     if identity is None:
+         raise NotFoundException(f"EDIPI {edipi} not found in user identity source")
+     return identity
+ 
+ 
+ async def _get_identity(
+     db: AsyncSession,
+     edipi: str,
+     *,
+     caller_edipi: str,
+ ) -> UserIdentity | None:
+     return await _identity_adapter().get_identity(db, edipi, caller_edipi=caller_edipi)
+ 
+ 
+ async def _load_users_with_roles(
+     db: AsyncSession, *, active_only: bool
+ ) -> Sequence[User]:
+     stmt = select(User).options(selectinload(User.roles).selectinload(UserRole.role))
+     if active_only:
+         stmt = stmt.where(User.is_active.is_(True))
+     stmt = stmt.order_by(User.edipi)
+     return (await db.scalars(stmt)).all()
+ 
+ 
+ # ── User queries ───────────────────────────────────────────────────────────────
+ 
+ 
+ async def get_display_names_by_ids(
+     db: AsyncSession,
+     user_ids: Sequence[uuid.UUID],
+     *,
+     caller_edipi: str,
+ ) -> dict[uuid.UUID, str]:
+     """Resolve display names for specific user IDs without listing all users."""
+     unique_ids = {user_id for user_id in user_ids if user_id}
+     if not unique_ids:
+         return {}
+ 
+     names: dict[uuid.UUID, str] = {}
+     if SYSTEM_USER_ID in unique_ids:
+         names[SYSTEM_USER_ID] = "System"
+ 
+     lookup_ids = unique_ids - {SYSTEM_USER_ID}
+     if not lookup_ids:
+         return names
+ 
+     users = (await db.scalars(select(User).where(User.id.in_(lookup_ids)))).all()
+     for user in users:
+         identity = await _get_identity(db, user.edipi, caller_edipi=caller_edipi)
+         if identity and identity.full_name.strip():
+             names[user.id] = identity.full_name.strip()
+             continue
+ 
+         local = _identity_from_local_user(user)
+-        names[user.id] = local.full_name.strip() or user.edipi
++        names[user.id] = (
++            local.full_name.strip() or user.username or user.edipi or str(user.id)
++        )
+ 
+     return names
+ 
+ 
+ async def get_users(
+     db: AsyncSession,
+     *,
+     filter: str | None = None,
+     active_only: bool = True,
+     caller_edipi: str,
+ ) -> list[dict]:
+     data, _ = await _identity_adapter().query_users(
+         db, active_only=active_only, filter=filter, caller_edipi=caller_edipi
+     )
+     return data
+ 
+ 
+ async def get_users_paged(
+     db: AsyncSession,
+     *,
+     skip: int | None,
+     take: int | None,
+     filter: str | None = None,
+     active_only: bool = True,
+     caller_edipi: str,
+ ) -> dict:
+     data, total = await _identity_adapter().query_users(
+         db,
+         active_only=active_only,
+         filter=filter,
+         skip=skip,
+         take=take,
+         caller_edipi=caller_edipi,
+     )
+     return {"data": data, "total_records": total}
+ 
+ 
+ async def get_user(db: AsyncSession, user_id: uuid.UUID, *, caller_edipi: str) -> dict:
+     user = await user_service.get_or_404(db, user_id)
+     identity = await _require_identity(db, user.edipi, caller_edipi=caller_edipi)
+     return _build_user_read(user, identity)
+ 
+ 
+ async def get_user_by_edipi(db: AsyncSession, edipi: str) -> User | None:
+     from app.core.exceptions import AppException
+ 
+     try:
+         validate_edipi(edipi)
+     except ValueError as exc:
+         raise AppException(str(exc)) from exc
+     result = await db.scalars(select(User).where(User.edipi == edipi))
+     return result.first()
+ 
+ 
+ async def search_users(
+     db: AsyncSession,
+     term: str,
+     *,
+     caller_edipi: str,
+ ) -> list[dict]:
+diff --git a/backend/python/app/tasks/cache_sweep.py b/backend/python/app/tasks/cache_sweep.py
+index cab49d9..7651b82 100644
+--- a/backend/python/app/tasks/cache_sweep.py
++++ b/backend/python/app/tasks/cache_sweep.py
+@@ -1,29 +1,32 @@
+ """
+ Periodic sweep of in-process caches (providers.cache, providers.auth).
+ 
+ Both caches only evict lazily (on read) plus a hard cap on write. This task
+ actively removes expired entries on a fixed interval so keys that are never
+ re-read — e.g. an event-detail window for a past date range, or a token for a
+ provider that stopped being called — don't linger in memory for the lifetime
+ of the worker process.
+ """
+ 
+ from __future__ import annotations
+ 
+ import structlog
+ 
+ from app.providers import auth as provider_auth
+ from app.providers import cache as event_cache
++from app.providers import sp_api_proxy
+ 
+ log = structlog.get_logger()
+ 
+ 
+ async def run() -> None:
+     cache_evicted = event_cache.sweep()
+     token_evicted = provider_auth.sweep_tokens()
+-    if cache_evicted or token_evicted:
++    list_evicted = sp_api_proxy.sweep_lists()
++    if cache_evicted or token_evicted or list_evicted:
+         log.info(
+             "cache_sweep_complete",
+             event_cache_evicted=cache_evicted,
+             token_cache_evicted=token_evicted,
++            sp_list_cache_evicted=list_evicted,
+         )
+diff --git a/backend/python/migrations/versions/0016_add_username_make_edipi_nullable.py b/backend/python/migrations/versions/0016_add_username_make_edipi_nullable.py
+new file mode 100644
+index 0000000..961870e
+--- /dev/null
++++ b/backend/python/migrations/versions/0016_add_username_make_edipi_nullable.py
+@@ -0,0 +1,30 @@
++"""Add username column to users; make edipi nullable for Windows-proxy auth
++
++Revision ID: 0016
++Revises: 0015
++Create Date: 2026-11-09
++"""
++
++import sqlalchemy as sa
++from alembic import op
++
++revision = "0016"
++down_revision = "0015"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.add_column("users", sa.Column("username", sa.String(), nullable=True))
++    op.create_unique_constraint("uq_users_username", "users", ["username"])
++    op.create_index("ix_users_username", "users", ["username"])
++
++    op.alter_column("users", "edipi", existing_type=sa.String(length=10), nullable=True)
++
++
++def downgrade() -> None:
++    op.drop_index("ix_users_username", table_name="users")
++    op.drop_constraint("uq_users_username", "users", type_="unique")
++    op.drop_column("users", "username")
++
++    op.alter_column("users", "edipi", existing_type=sa.String(length=10), nullable=False)
+diff --git a/backend/python/tests/unit/test_auth.py b/backend/python/tests/unit/test_auth.py
+index 1ce1bcc..67e32d6 100644
+--- a/backend/python/tests/unit/test_auth.py
++++ b/backend/python/tests/unit/test_auth.py
+@@ -1,132 +1,136 @@
+ """Unit tests for JWT validation and role enforcement (US-201, US-202, US-203)."""
+ 
++from unittest.mock import MagicMock
++
+ import pytest
+ from cryptography.hazmat.backends import default_backend
+ from cryptography.hazmat.primitives.asymmetric import rsa
+ from fastapi import HTTPException
+ from jose import jwt
+ 
+ from app.core.auth import CurrentUser, _decode_token, _extract_roles
+ from app.core.dependencies import RoleNames, require_roles
+ 
+ # ── Helpers ────────────────────────────────────────────────────────────────────
+ 
+ 
+ def _make_rsa_key():
+     return rsa.generate_private_key(
+         public_exponent=65537, key_size=2048, backend=default_backend()
+     )
+ 
+ 
+ # ── _extract_roles ─────────────────────────────────────────────────────────────
+ 
+ 
+ def test_extract_roles_list():
+     assert _extract_roles({"roles": ["Admin", "User"]}) == ["Admin", "User"]
+ 
+ 
+ def test_extract_roles_single_string():
+     assert _extract_roles({"roles": "Admin"}) == ["Admin"]
+ 
+ 
+ def test_extract_roles_missing():
+     assert _extract_roles({}) == []
+ 
+ 
+ def test_extract_roles_fallback_to_role_claim():
+     assert _extract_roles({"role": "Guest"}) == ["Guest"]
+ 
+ 
+ # ── Token decode (dev mode, no JWKS) ──────────────────────────────────────────
+ 
+ 
+ def test_decode_token_dev_mode_no_jwks(monkeypatch):
+     """In development with no JWKS loaded, unverified claims are returned."""
+     monkeypatch.setattr("app.core.auth._jwks_cache", {})
+     monkeypatch.setattr("app.core.auth.settings.environment", "development")
+ 
+     # Build a dummy token (no signature verification in dev mode)
+     key = _make_rsa_key()
+     from cryptography.hazmat.primitives import serialization
+ 
+     private_pem = key.private_bytes(
+         serialization.Encoding.PEM,
+         serialization.PrivateFormat.TraditionalOpenSSL,
+         serialization.NoEncryption(),
+     )
+     token = jwt.encode(
+         {"sub": "test-user", "roles": ["Admin"], "iss": "https://test/"},
+         private_pem,
+         algorithm="RS256",
+     )
+     payload = _decode_token(token)
+     assert payload["sub"] == "test-user"
+ 
+ 
+ def test_decode_token_raises_401_when_no_jwks_in_production(monkeypatch):
+     monkeypatch.setattr("app.core.auth._jwks_cache", {})
+     monkeypatch.setattr("app.core.auth.settings.environment", "production")
+     with pytest.raises(HTTPException) as exc_info:
+         _decode_token("not.a.token")
+     assert exc_info.value.status_code == 401
+ 
+ 
+ # ── require_roles dependency ───────────────────────────────────────────────────
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_require_roles_passes_when_user_has_role():
+     dep = require_roles(RoleNames.ADMIN)
+     user = CurrentUser(sub="u1", roles=["Admin"])
+     result = await dep.__wrapped__(user) if hasattr(dep, "__wrapped__") else None
+     # Call the inner _check function directly
+ 
+     # Get the inner function from the closure
+     inner = dep
+     result = await inner(current_user=user)
+     assert result.sub == "u1"
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_require_roles_raises_403_when_missing_role():
+     dep = require_roles(RoleNames.ADMIN)
+     user = CurrentUser(sub="u2", roles=["User"])
+     with pytest.raises(HTTPException) as exc_info:
+         await dep(current_user=user)
+     assert exc_info.value.status_code == 403
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_require_roles_empty_allows_any_authenticated():
+     dep = require_roles()
+     user = CurrentUser(sub="u3", roles=["Guest"])
+     result = await dep(current_user=user)
+     assert result.sub == "u3"
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_get_current_user_returns_mock_when_bypass_enabled_and_no_token(
+     monkeypatch,
+ ):
+     from app.core.auth import get_current_user
+ 
+     monkeypatch.setattr("app.core.auth.settings.auth_bypass_enabled", True)
+     monkeypatch.setattr("app.core.auth.settings.auth_bypass_environments", [])
++    monkeypatch.setattr("app.core.auth.settings.auth_source", "jwt")
+     from app.mock_data.store import DEV_MOCK_USER_ID
+ 
+-    user = await get_current_user(credentials=None)
++    user = await get_current_user(request=MagicMock(headers={}), credentials=None)
+     assert user.sub == str(DEV_MOCK_USER_ID)
+     assert user.user_id == str(DEV_MOCK_USER_ID)
+     assert "Admin" in user.roles
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_get_current_user_raises_without_token_when_bypass_disabled(monkeypatch):
+     from app.core.auth import get_current_user
+ 
+     monkeypatch.setattr("app.core.auth.settings.auth_bypass_enabled", False)
+     monkeypatch.setattr("app.core.auth.settings.auth_bypass_environments", [])
++    monkeypatch.setattr("app.core.auth.settings.auth_source", "jwt")
+     monkeypatch.setattr("app.core.auth.settings.environment", "production")
+     with pytest.raises(HTTPException) as exc_info:
+-        await get_current_user(credentials=None)
++        await get_current_user(request=MagicMock(headers={}), credentials=None)
+     assert exc_info.value.status_code == 401
+diff --git a/backend/python/tests/unit/test_event_caching.py b/backend/python/tests/unit/test_event_caching.py
+new file mode 100644
+index 0000000..5f15aac
+--- /dev/null
++++ b/backend/python/tests/unit/test_event_caching.py
+@@ -0,0 +1,211 @@
++"""Unit tests for provider-level cache lifetimes and user-requested refresh."""
++
++import asyncio
++from datetime import UTC, datetime, timedelta
++
++import httpx
++import pytest
++
++from app.providers import cache as event_cache
++from app.providers import sp_api_proxy
++from app.providers.base import EventDetail, EventDetailArgs
++from app.providers.sharepoint import SharePointProvider
++
++PROXY_URL = "http://localhost:3033/sp-api"
++
++ROWS = [
++    {"Title": "June", "EventDate": "2026-06-10T09:00:00Z"},
++    {"Title": "July", "EventDate": "2026-07-10T09:00:00Z"},
++]
++
++
++@pytest.fixture
++def proxy(monkeypatch):
++    monkeypatch.setattr(sp_api_proxy.settings, "sp_api_proxy_url", PROXY_URL)
++    monkeypatch.setattr(sp_api_proxy.settings, "event_detail_cache_enabled", True)
++    sp_api_proxy.clear_list_cache()
++    state = {"calls": 0}
++
++    async def handler(request: httpx.Request) -> httpx.Response:
++        state["calls"] += 1
++        await asyncio.sleep(0)
++        return httpx.Response(200, json={"value": ROWS})
++
++    real_client = httpx.AsyncClient
++    monkeypatch.setattr(
++        sp_api_proxy.httpx,
++        "AsyncClient",
++        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
++    )
++    yield state
++    sp_api_proxy.clear_list_cache()
++
++
++def _args(month: int, *, force: bool = False, ttl: object = "300") -> EventDetailArgs:
++    return EventDetailArgs(
++        resource_id="res-1",
++        source_name="SP Events",
++        start=datetime(2026, month, 1, tzinfo=UTC),
++        end=datetime(2026, month, 28, tzinfo=UTC),
++        provider_properties={"url": PROXY_URL, "cacheExpireSeconds": ttl},
++        source_properties={"url": "Team Events"},
++        force_refresh=force,
++    )
++
++
++# ── Provider cache lifetime ────────────────────────────────────────────────────
++
++
++def test_ttl_seconds_uses_provider_setting_with_global_fallback(monkeypatch):
++    monkeypatch.setattr(event_cache.settings, "event_detail_cache_seconds", 30)
++    assert event_cache.ttl_seconds({"cacheExpireSeconds": "600"}) == 600
++    assert event_cache.ttl_seconds({"cacheExpireSeconds": 900}) == 900
++    assert event_cache.ttl_seconds({"cacheExpireSeconds": ""}) == 30
++    assert event_cache.ttl_seconds({"cacheExpireSeconds": "abc"}) == 30
++    assert event_cache.ttl_seconds({"cacheExpireSeconds": 0}) == 30
++    assert event_cache.ttl_seconds({}) == 30
++    assert event_cache.ttl_seconds(None) == 30
++
++
++def test_cache_put_honours_explicit_ttl(monkeypatch):
++    monkeypatch.setattr(event_cache.settings, "event_detail_cache_enabled", True)
++    monkeypatch.setattr(event_cache.settings, "event_detail_cache_seconds", 30)
++    event_cache.clear()
++    start, end = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 31, tzinfo=UTC)
++
++    event_cache.put(
++        "res-ttl", start, end, [EventDetail(id="1", name="x", source_name="s")], ttl=600
++    )
++
++    _, expires_at = event_cache._store[event_cache._key("res-ttl", start, end)]
++    remaining = (expires_at - datetime.now(UTC)).total_seconds()
++    assert 590 < remaining <= 600
++    event_cache.clear()
++
++
++# ── Whole-list cache behind the SharePoint proxy ───────────────────────────────
++
++
++async def test_list_is_downloaded_once_across_date_windows(proxy):
++    prov = SharePointProvider()
++
++    june = await prov.get_events(_args(6))
++    july = await prov.get_events(_args(7))
++
++    assert [e.name for e in june] == ["June"]
++    assert [e.name for e in july] == ["July"]
++    assert proxy["calls"] == 1
++
++
++async def test_force_refresh_redownloads_and_replaces_cached_list(proxy):
++    prov = SharePointProvider()
++
++    await prov.get_events(_args(6))
++    await prov.get_events(_args(6, force=True))
++    assert proxy["calls"] == 2
++
++    await prov.get_events(_args(7))
++    assert proxy["calls"] == 2
++
++
++async def test_expired_list_is_downloaded_again(proxy):
++    prov = SharePointProvider()
++    await prov.get_events(_args(6))
++
++    key = next(iter(sp_api_proxy._list_cache))
++    rows, _ = sp_api_proxy._list_cache[key]
++    sp_api_proxy._list_cache[key] = (rows, datetime.now(UTC) - timedelta(seconds=1))
++
++    await prov.get_events(_args(6))
++    assert proxy["calls"] == 2
++
++
++async def test_concurrent_requests_share_one_download(proxy):
++    prov = SharePointProvider()
++
++    await asyncio.gather(*(prov.get_events(_args(6)) for _ in range(5)))
++    assert proxy["calls"] == 1
++
++    await asyncio.gather(*(prov.get_events(_args(6, force=True)) for _ in range(5)))
++    assert proxy["calls"] == 2
++
++
++async def test_list_cache_is_skipped_when_caching_disabled(proxy, monkeypatch):
++    monkeypatch.setattr(sp_api_proxy.settings, "event_detail_cache_enabled", False)
++    prov = SharePointProvider()
++
++    await prov.get_events(_args(6))
++    await prov.get_events(_args(7))
++    assert proxy["calls"] == 2
++
++
++async def test_sweep_lists_evicts_only_expired_entries(proxy):
++    await sp_api_proxy.fetch_list_items(PROXY_URL, "Live", ttl_seconds=300)
++    await sp_api_proxy.fetch_list_items(PROXY_URL, "Stale", ttl_seconds=300)
++    stale_key = next(k for k in sp_api_proxy._list_cache if k.endswith("|Stale"))
++    rows, _ = sp_api_proxy._list_cache[stale_key]
++    sp_api_proxy._list_cache[stale_key] = (
++        rows,
++        datetime.now(UTC) - timedelta(seconds=1),
++    )
++
++    assert sp_api_proxy.sweep_lists() == 1
++    assert list(sp_api_proxy._list_cache) == [f"{PROXY_URL}|Live"]
++
++
++# ── Service: refresh bypasses the per-window event cache ───────────────────────
++
++
++async def test_fetch_source_force_refresh_bypasses_event_cache(monkeypatch):
++    import uuid
++    from types import SimpleNamespace
++
++    from app.services import event_details as svc
++
++    monkeypatch.setattr(event_cache.settings, "event_detail_cache_enabled", True)
++    event_cache.clear()
++    source_id = uuid.uuid4()
++    row = (
++        SimpleNamespace(name="Src", properties={}),
++        SimpleNamespace(properties={"cacheExpireSeconds": "600"}),
++        SimpleNamespace(name="SharePoint"),
++    )
++
++    class _Session:
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, *exc):
++            return False
++
++        async def execute(self, _stmt):
++            return SimpleNamespace(first=lambda: row)
++
++    import app.db.session as db_session
++
++    monkeypatch.setattr(db_session, "AsyncSessionLocal", lambda: _Session())
++
++    seen: list[bool] = []
++
++    class _Provider:
++        async def get_events(self, args):
++            seen.append(args.force_refresh)
++            return [
++                EventDetail(id=str(len(seen)), name="e", source_name=args.source_name)
++            ]
++
++    monkeypatch.setattr(svc, "_provider_for_type", lambda *a, **k: _Provider())
++    start, end = datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 30, tzinfo=UTC)
++
++    first = await svc._fetch_source(source_id, start, end)
++    cached = await svc._fetch_source(source_id, start, end)
++    forced = await svc._fetch_source(source_id, start, end, force_refresh=True)
++    after = await svc._fetch_source(source_id, start, end)
++
++    assert seen == [False, True]
++    assert cached[0].id == first[0].id == "1"
++    assert forced[0].id == after[0].id == "2"
++
++    _, expires_at = event_cache._store[event_cache._key(str(source_id), start, end)]
++    assert (expires_at - datetime.now(UTC)).total_seconds() > 500
++    event_cache.clear()
+diff --git a/backend/python/tests/unit/test_sp_api_proxy.py b/backend/python/tests/unit/test_sp_api_proxy.py
+new file mode 100644
+index 0000000..960c941
+--- /dev/null
++++ b/backend/python/tests/unit/test_sp_api_proxy.py
+@@ -0,0 +1,164 @@
++"""Unit tests for reading SharePoint lists through sp-api-proxy."""
++
++from datetime import UTC, datetime
++
++import httpx
++import pytest
++
++from app.core.exceptions import SharePointException
++from app.providers import sp_api_proxy
++from app.providers.base import EventDetailArgs
++from app.providers.sharepoint import SharePointProvider
++
++PROXY_URL = "http://localhost:3033/sp-api"
++
++LIST_PAYLOAD = {
++    "odata.metadata": "https://sp.local/_api/$metadata#SP.ListData.EventsListItems",
++    "value": [
++        {
++            "odata.type": "SP.Data.EventsListItem",
++            "Id": 1,
++            "Title": "Staff Sync",
++            "EventDate": "2026-06-10T09:00:00Z",
++            "EndDate": "2026-06-10T10:00:00Z",
++            "Category": "Meeting",
++        },
++        {
++            "Id": 2,
++            "Title": "Long Exercise",
++            "EventDate": "2026-05-20T00:00:00Z",
++            "EndDate": "2026-06-05T00:00:00Z",
++            "Category": "Training",
++            "fAllDayEvent": True,
++        },
++        {
++            "Id": 3,
++            "Title": "Old Event",
++            "EventDate": "2025-01-01T09:00:00Z",
++            "EndDate": "2025-01-01T10:00:00Z",
++            "Category": "Meeting",
++        },
++        {"Id": 4, "Title": "No Dates", "Category": "Meeting"},
++    ],
++}
++
++
++@pytest.fixture
++def proxy(monkeypatch):
++    """Point settings at the proxy and serve requests from a mock transport."""
++    monkeypatch.setattr(sp_api_proxy.settings, "sp_api_proxy_url", PROXY_URL)
++    sp_api_proxy.clear_list_cache()
++    state: dict = {"requests": [], "status": 200, "payload": LIST_PAYLOAD}
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        state["requests"].append(request)
++        if request.url.path.endswith("/health"):
++            return httpx.Response(state["status"], json={"status": "ok"})
++        return httpx.Response(state["status"], json=state["payload"])
++
++    real_client = httpx.AsyncClient
++    monkeypatch.setattr(
++        sp_api_proxy.httpx,
++        "AsyncClient",
++        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
++    )
++    return state
++
++
++def _args(**source_props) -> EventDetailArgs:
++    return EventDetailArgs(
++        resource_id="res-1",
++        source_name="SP Events",
++        start=datetime(2026, 6, 1, tzinfo=UTC),
++        end=datetime(2026, 6, 30, tzinfo=UTC),
++        provider_properties={"url": PROXY_URL + "/"},
++        source_properties={"url": "Team Events", **source_props},
++    )
++
++
++def test_is_proxy_url_matches_configured_url_only(monkeypatch):
++    monkeypatch.setattr(sp_api_proxy.settings, "sp_api_proxy_url", PROXY_URL)
++    assert sp_api_proxy.is_proxy_url("HTTP://localhost:3033/sp-api/")
++    assert not sp_api_proxy.is_proxy_url("https://sp.local/sites/team")
++
++    monkeypatch.setattr(sp_api_proxy.settings, "sp_api_proxy_url", "")
++    assert not sp_api_proxy.is_proxy_url("")
++    assert not sp_api_proxy.is_proxy_url(PROXY_URL)
++
++
++def test_extract_items_handles_all_payload_shapes():
++    rows = [{"Id": 1}]
++    assert sp_api_proxy.extract_items({"value": rows}) == rows
++    assert sp_api_proxy.extract_items({"d": {"results": rows}}) == rows
++    assert sp_api_proxy.extract_items(rows) == rows
++    assert sp_api_proxy.extract_items({"error": "nope"}) == []
++    assert sp_api_proxy.extract_items(None) == []
++
++
++async def test_get_events_returns_only_events_overlapping_window(proxy):
++    events = await SharePointProvider().get_events(_args())
++
++    assert sorted(e.name for e in events) == ["Long Exercise", "Staff Sync"]
++    sync = next(e for e in events if e.name == "Staff Sync")
++    assert sync.start_dtime == datetime(2026, 6, 10, 9, tzinfo=UTC)
++    assert sync.end_dtime == datetime(2026, 6, 10, 10, tzinfo=UTC)
++    assert sync.source_name == "SP Events"
++    assert sync.resource_id == "res-1"
++    assert sync.properties["Category"] == "Meeting"
++    assert next(e for e in events if e.name == "Long Exercise").is_all_day
++
++
++async def test_get_events_requests_list_by_encoded_title(proxy):
++    await SharePointProvider().get_events(_args())
++
++    assert len(proxy["requests"]) == 1
++    assert proxy["requests"][0].url.raw_path == b"/sp-api/list-items/Team%20Events"
++
++
++async def test_get_events_honours_custom_fields_and_source_filter(proxy):
++    proxy["payload"] = {
++        "value": [
++            {"Subject": "A", "Begin": "2026-06-02T08:00:00Z", "Kind": "Keep"},
++            {"Subject": "B", "Begin": "2026-06-03T08:00:00Z", "Kind": "Drop"},
++        ]
++    }
++    events = await SharePointProvider().get_events(
++        _args(
++            titleFieldName="Subject",
++            startDtimeFieldName="Begin",
++            endDtimeFieldName="Finish",
++            filter='{"field": "Kind", "operator": "eq", "value": "Keep"}',
++        )
++    )
++
++    assert [e.name for e in events] == ["A"]
++    assert events[0].end_dtime is None
++
++
++async def test_get_events_raises_sharepoint_exception_on_proxy_error(proxy):
++    proxy["status"] = 500
++    with pytest.raises(SharePointException):
++        await SharePointProvider().get_events(_args())
++
++
++async def test_source_fields_and_test_source_via_proxy(proxy):
++    prov = SharePointProvider()
++    pp, sp = {"url": PROXY_URL}, {"url": "Team Events"}
++
++    fields = await prov.get_source_fields(pp, sp)
++    assert fields == ["Id", "Title", "EventDate", "EndDate", "Category", "fAllDayEvent"]
++
++    result = await prov.test_source(pp, sp)
++    assert result["success"] is True
++
++    proxy["status"] = 500
++    assert await prov.get_source_fields(pp, sp) == []
++
++
++async def test_get_status_uses_proxy_health(proxy):
++    prov = SharePointProvider()
++    assert await prov.get_status({"url": PROXY_URL}) == "ok"
++    assert proxy["requests"][-1].url.path == "/sp-api/health"
++
++    proxy["status"] = 503
++    assert await prov.get_status({"url": PROXY_URL}) == "degraded"
+diff --git a/frontend/e2e/admin-access.spec.ts b/frontend/e2e/admin-access.spec.ts
+index 955ae36..3e88b26 100644
+--- a/frontend/e2e/admin-access.spec.ts
++++ b/frontend/e2e/admin-access.spec.ts
+@@ -1,27 +1,27 @@
+-import { expect, test } from '@playwright/test';
++import { expect, test } from './helpers/test';
+ import { stubNonAdminUserProfile } from './helpers/admin';
+ 
+ /**
+  * Negative-path access control for admin routes (RequireAdmin).
+  * Scheduler has no role gate yet — see scheduler-access.spec.ts.
+  */
+ test.describe('Admin access control', () => {
+     test(
+         'non-admin user is redirected to unauthorized',
+         { tag: '@smoke' },
+         async ({ page }) => {
+             await stubNonAdminUserProfile(page);
+ 
+             await page.goto('/admin/providers');
+             await expect(page).toHaveURL(/\/unauthorized\/?$/, {
+                 timeout: 30_000
+             });
+             await expect(
+                 page.getByRole('heading', { name: /Access Denied/i })
+             ).toBeVisible();
+             await expect(
+                 page.getByRole('heading', { name: /^Providers$/i })
+             ).toHaveCount(0);
+         }
+     );
+ });
+diff --git a/frontend/e2e/admin-event-providers.spec.ts b/frontend/e2e/admin-event-providers.spec.ts
+index 32a68ec..367b044 100644
+--- a/frontend/e2e/admin-event-providers.spec.ts
++++ b/frontend/e2e/admin-event-providers.spec.ts
+@@ -1,61 +1,61 @@
+-import { expect, test, type Page } from '@playwright/test';
++import { expect, test, type Page } from './helpers/test';
+ import {
+     expectAdministratorSession,
+     gotoProvidersAdmin
+ } from './helpers/admin';
+ 
+ const providerRow = (page: Page, name: string) =>
+     page.getByRole('row').filter({ has: page.getByText(name, { exact: true }) });
+ 
+ test.describe('Admin event provider management', () => {
+     test('administrator can create, edit, and delete an event provider', async ({
+         page
+     }) => {
+         const unique = Date.now();
+         const providerName = `E2E SharePoint ${unique}`;
+         const updatedName = `${providerName} Updated`;
+         const providerUrl = `https://e2e.example.mil/sites/slate-${unique}`;
+ 
+         // Bypass Admin identity (OIDC UI login is not wired yet)
+         await expectAdministratorSession(page);
+ 
+         await gotoProvidersAdmin(page);
+ 
+         // ── Create ──────────────────────────────────────────────────────────
+         await page.getByRole('button', { name: /^Add provider$/i }).click();
+         const createDialog = page.getByRole('dialog');
+         await expect(
+             createDialog.getByRole('heading', { name: /^Add provider$/i })
+         ).toBeVisible();
+ 
+         await createDialog.getByRole('textbox', { name: /^Name$/i }).fill(
+             providerName
+         );
+         await createDialog.getByRole('combobox').click();
+         await page.getByRole('option', { name: 'SharePoint' }).click();
+         await createDialog.getByLabel(/^URL$/i).fill(providerUrl);
+         await createDialog
+             .getByLabel(/Cache Duration \(seconds\)/i)
+             .fill('300');
+         await createDialog
+             .getByRole('button', { name: /^Add provider$/i })
+             .click();
+ 
+         await expect(createDialog).toHaveCount(0);
+         await expect(page.getByText(`"${providerName}" created.`)).toBeVisible();
+         await expect(providerRow(page, providerName)).toBeVisible();
+         await expect(providerRow(page, providerName)).toContainText(
+             'SharePoint'
+         );
+ 
+         // ── Edit ────────────────────────────────────────────────────────────
+         await providerRow(page, providerName)
+             .getByRole('button', { name: 'Edit' })
+             .click();
+         const editDialog = page.getByRole('dialog');
+         await expect(
+             editDialog.getByRole('heading', { name: /^Edit provider$/i })
+         ).toBeVisible();
+ 
+         await editDialog.getByRole('textbox', { name: /^Name$/i }).fill(
+             updatedName
+diff --git a/frontend/e2e/helpers/test.ts b/frontend/e2e/helpers/test.ts
+new file mode 100644
+index 0000000..370f957
+--- /dev/null
++++ b/frontend/e2e/helpers/test.ts
+@@ -0,0 +1,23 @@
++import { test as base, expect } from '@playwright/test';
++
++/**
++ * Test fixture that acknowledges the DoD warning before each page loads.
++ *
++ * The warning dialog is modal (Radix), so while it is open the rest of the app
++ * is hidden from accessibility queries (getByRole('banner'), etc.).
++ * Use this `test` instead of importing from '@playwright/test' in specs.
++ */
++export const test = base.extend({
++    page: async ({ page }, use) => {
++        await page.addInitScript(() => {
++            try {
++                window.sessionStorage.setItem('dod-warning-acknowledged', 'true');
++            } catch {
++                /* storage unavailable: dialog will show */
++            }
++        });
++        await use(page);
++    }
++});
++
++export { expect };
+diff --git a/frontend/e2e/scheduler-access.spec.ts b/frontend/e2e/scheduler-access.spec.ts
+index 1290a4a..73a9d68 100644
+--- a/frontend/e2e/scheduler-access.spec.ts
++++ b/frontend/e2e/scheduler-access.spec.ts
+@@ -1,55 +1,55 @@
+-import { expect, test } from '@playwright/test';
++import { expect, test } from './helpers/test';
+ import { expectBypassUserIdentity } from './helpers/auth';
+ import { waitForSchedulerReady } from './helpers/scheduler';
+ 
+ /**
+  * Bypass-identity smoke until OIDC UI login exists.
+  *
+  * Under AUTH_BYPASS_ENABLED the API auto-authenticates, so these tests prove
+  * the scheduler happy path for the bypass user and that hard API 401s still
+  * kick the browser to /loggedoff — not that IdP login or role gates work.
+  */
+ test.describe('Scheduler access', () => {
+     test(
+         'bypass identity can open the scheduler',
+         { tag: '@smoke' },
+         async ({ page }) => {
+             await expectBypassUserIdentity(page);
+ 
+             await page.goto('/slate');
+             await expect(page).toHaveURL(/\/slate\/?$/);
+             await expect(page).not.toHaveURL(/\/loggedoff|\/unauthorized/);
+ 
+             const header = page.getByRole('banner');
+             await expect(header).toBeVisible();
+             await expect(header).toContainText('SOCEUR J6');
+ 
+             await waitForSchedulerReady(page);
+             await expect(
+                 page.getByRole('button', { name: 'Zoom out' })
+             ).toBeVisible();
+             await expect(page.getByText('1 Month')).toBeVisible();
+             await expect(page.getByText('Loading calendar…')).toHaveCount(0);
+         }
+     );
+ 
+     test(
+         'API 401 while loading the scheduler sends the user to logged off',
+         { tag: '@smoke' },
+         async ({ page }) => {
+             await page.route('**/api/**', async (route) => {
+                 await route.fulfill({
+                     status: 401,
+                     contentType: 'application/json',
+                     body: JSON.stringify({ message: 'Unauthorized' })
+                 });
+             });
+ 
+             await page.goto('/slate');
+             await expect(page).toHaveURL(/\/loggedoff\/?$/, { timeout: 30_000 });
+             await expect(
+                 page.getByRole('button', { name: 'Zoom out' })
+             ).toHaveCount(0);
+         }
+     );
+ });
+diff --git a/frontend/e2e/scheduler-view-switch.spec.ts b/frontend/e2e/scheduler-view-switch.spec.ts
+index a092587..53d489e 100644
+--- a/frontend/e2e/scheduler-view-switch.spec.ts
++++ b/frontend/e2e/scheduler-view-switch.spec.ts
+@@ -1,61 +1,61 @@
+-import { expect, test, type Locator, type Page } from '@playwright/test';
++import { expect, test, type Locator, type Page } from './helpers/test';
+ 
+ const openRibbon = async (page: Page): Promise<void> => {
+     const openButton = page.getByRole('button', { name: 'Open ribbon' });
+     if (await openButton.isVisible()) {
+         await openButton.click();
+     }
+     await expect(
+         page.getByRole('button', { name: 'Close ribbon' })
+     ).toBeVisible();
+ };
+ 
+ const expectSwimlaneView = async (page: Page): Promise<void> => {
+     await expect(page.getByRole('button', { name: 'Zoom out' })).toBeVisible();
+     await expect(page.getByText('1 Month')).toBeVisible();
+     // Empty range copy, or the swimlane month label when events/columns render
+     await expect(
+         page
+             .getByText('No events in this date range.')
+             .or(page.getByText(/^[A-Z][a-z]+ \d{4}$/))
+             .first()
+     ).toBeVisible();
+     await expect(page.getByTestId('agenda-day-banner')).toHaveCount(0);
+     await expect(
+         page.getByRole('slider', { name: 'Number of months to stack' })
+     ).toHaveCount(0);
+ };
+ 
+ const expectDailyAgendaView = async (page: Page): Promise<void> => {
+     const agendaToggle = page.getByRole('button', {
+         name: 'Toggle daily agenda view'
+     });
+     await expect(agendaToggle).toHaveAttribute('aria-pressed', 'true');
+     await expect(page.getByTestId('agenda-day-banner')).toBeVisible();
+     await expect(
+         page.getByTestId('agenda-day-banner').getByRole('heading')
+     ).toBeVisible();
+     await expect(
+         page
+             .getByText('No events scheduled for this day.')
+             .or(page.getByTestId('agenda-event-row'))
+             .first()
+     ).toBeVisible();
+     await expect(page.getByRole('button', { name: 'Zoom out' })).toHaveCount(0);
+ };
+ 
+ const expectStackedMonthlyView = async (page: Page): Promise<void> => {
+     await expect(
+         page.getByRole('switch', { name: 'Stacked 30-day view' })
+     ).toBeChecked();
+     await expect(
+         page.getByRole('slider', { name: 'Number of months to stack' })
+     ).toBeVisible();
+     await expect(page.getByText('Months shown')).toBeVisible();
+     await expect(
+         page.getByRole('heading', { name: /^[A-Z][a-z]+ \d{4}$/ }).first()
+     ).toBeVisible();
+     await expect(
+         page
+             .getByText('No events this month.')
+             .or(page.getByText(/^\d+ days$/))
+diff --git a/frontend/e2e/slate-home.spec.ts b/frontend/e2e/slate-home.spec.ts
+index 6f1041a..95dc8d3 100644
+--- a/frontend/e2e/slate-home.spec.ts
++++ b/frontend/e2e/slate-home.spec.ts
+@@ -1,18 +1,18 @@
+-import { test, expect } from '@playwright/test';
++import { test, expect } from './helpers/test';
+ 
+ test.describe('Slate shell', () => {
+     test('home shell renders brand and chrome', { tag: '@smoke' }, async ({ page }) => {
+         await page.goto('/');
+         const header = page.getByRole('banner');
+         await expect(header).toBeVisible();
+         await expect(header).toContainText('SOCEUR J6');
+         await expect(header.getByRole('button', { name: 'Toggle sidebar' })).toBeVisible();
+         await expect(header.getByRole('button', { name: 'Toggle theme' })).toBeVisible();
+     });
+ 
+     test('root redirects to scheduler route', async ({ page }) => {
+         await page.goto('/');
+         await expect(page).toHaveURL(/\/slate\/?$/);
+         await expect(page.getByRole('banner')).toBeVisible();
+     });
+ });
+diff --git a/frontend/src/components/auth/DoDWarningDialog.tsx b/frontend/src/components/auth/DoDWarningDialog.tsx
+new file mode 100644
+index 0000000..d6c19aa
+--- /dev/null
++++ b/frontend/src/components/auth/DoDWarningDialog.tsx
+@@ -0,0 +1,96 @@
++import { useNavigate } from 'react-router-dom';
++import {
++    Dialog,
++    DialogContent,
++    DialogFooter,
++    DialogHeader,
++    DialogTitle
++} from '@/components/ui/dialog';
++import { Button } from '@/components/ui/button';
++
++const SESSION_KEY = 'dod-warning-acknowledged';
++
++export function useDoDWarningAcknowledged() {
++    return sessionStorage.getItem(SESSION_KEY) === 'true';
++}
++
++export function DoDWarningDialog() {
++    const navigate = useNavigate();
++    const acknowledged = useDoDWarningAcknowledged();
++
++    function handleAgree() {
++        sessionStorage.setItem(SESSION_KEY, 'true');
++        // force re-render by reloading state — parent controls open via this value
++        window.dispatchEvent(new Event('dod-warning-acknowledged'));
++    }
++
++    function handleDecline() {
++        navigate('/loggedoff');
++    }
++
++    return (
++        <Dialog
++            open={!acknowledged}
++            onOpenChange={() => {
++                // intentionally empty — not dismissible
++            }}
++        >
++            <DialogContent
++                onPointerDownOutside={(e) => e.preventDefault()}
++                onEscapeKeyDown={(e) => e.preventDefault()}
++                className="max-w-lg"
++                hideCloseButton
++            >
++                <DialogHeader>
++                    <DialogTitle>Department of Defense System Usage Warning</DialogTitle>
++                </DialogHeader>
++
++                <div className="space-y-3 text-sm text-muted-foreground">
++                    <p>
++                        You are accessing a U.S. Government (USG) information system (IS) that is
++                        provided for USG-authorized use only.
++                    </p>
++                    <p>
++                        By using this IS (which includes any device attached to this IS), you
++                        consent to the following conditions:
++                    </p>
++                    <ul className="list-disc space-y-1 pl-5">
++                        <li>
++                            The USG routinely intercepts and monitors communications on this IS for
++                            purposes including, but not limited to, penetration testing, COMSEC
++                            monitoring, network operations and defense, personnel misconduct (PM),
++                            law enforcement (LE), and counterintelligence (CI) investigations.
++                        </li>
++                        <li>
++                            At any time, the USG may inspect and seize data stored on this IS.
++                        </li>
++                        <li>
++                            Communications using, or data stored on, this IS are not private, are
++                            subject to routine monitoring, interception, and search, and may be
++                            disclosed or used for any USG-authorized purpose.
++                        </li>
++                        <li>
++                            This IS includes security measures (e.g., authentication and access
++                            controls) to protect USG interests—not for your personal benefit or
++                            privacy.
++                        </li>
++                        <li>
++                            Notwithstanding the above, using this IS does not constitute consent to
++                            PM, LE, or CI investigative searching or monitoring of the content of
++                            privileged communications or data (including work product) that are
++                            protected by a recognized legal privilege or any statute prohibiting
++                            disclosure without legal process.
++                        </li>
++                    </ul>
++                </div>
++
++                <DialogFooter className="gap-2 sm:gap-0">
++                    <Button variant="outline" onClick={handleDecline}>
++                        Decline
++                    </Button>
++                    <Button onClick={handleAgree}>I Agree</Button>
++                </DialogFooter>
++            </DialogContent>
++        </Dialog>
++    );
++}
+diff --git a/frontend/src/components/layout/AppLayout.test.tsx b/frontend/src/components/layout/AppLayout.test.tsx
+index 4ec0258..24182a5 100644
+--- a/frontend/src/components/layout/AppLayout.test.tsx
++++ b/frontend/src/components/layout/AppLayout.test.tsx
+@@ -1,58 +1,59 @@
+ import { beforeEach, describe, expect, it } from 'vitest';
+ import { useAppStore } from '@/stores/appStore';
+ import { render, screen } from '@/test/test-utils';
+ import { AppLayout } from './AppLayout';
+ 
+ describe('AppLayout', () => {
+     beforeEach(() => {
+         useAppStore.setState({ isSidebarOpen: true, activeView: null });
++        sessionStorage.setItem('dod-warning-acknowledged', 'true');
+     });
+ 
+     describe('landmark regions', () => {
+         it('renders the header banner', () => {
+             render(<AppLayout />);
+             expect(screen.getByRole('banner')).toBeInTheDocument();
+         });
+ 
+         it('renders the complementary sidebar', () => {
+             render(<AppLayout />);
+             expect(screen.getByRole('complementary')).toBeInTheDocument();
+         });
+ 
+         it('renders the main content area', () => {
+             render(<AppLayout />);
+             expect(screen.getByRole('main')).toBeInTheDocument();
+         });
+ 
+         it('renders the navigation landmark', () => {
+             render(<AppLayout />);
+             // Reverted to standard role query to match unlabeled <nav> elements
+             expect(
+                 screen.getByRole('navigation', { name: /main navigation/i })
+             ).toBeInTheDocument();
+         });
+     });
+ 
+     describe('composition', () => {
+         it('renders sidebar toggle from Header', () => {
+             render(<AppLayout />);
+             expect(
+                 screen.getByRole('button', { name: /toggle sidebar/i })
+             ).toBeInTheDocument();
+         });
+ 
+         it('renders theme toggle from Header', () => {
+             render(<AppLayout />);
+             expect(
+                 screen.getByRole('button', { name: /toggle theme/i })
+             ).toBeInTheDocument();
+         });
+ 
+         it('renders route links inside the sidebar navigation', () => {
+             render(<AppLayout />);
+             expect(screen.getAllByRole('link').length).toBeGreaterThanOrEqual(
+                 2
+             );
+         });
+     });
+ });
+diff --git a/frontend/src/components/layout/AppLayout.tsx b/frontend/src/components/layout/AppLayout.tsx
+index f7bd988..8287660 100644
+--- a/frontend/src/components/layout/AppLayout.tsx
++++ b/frontend/src/components/layout/AppLayout.tsx
+@@ -1,23 +1,36 @@
+-import { Suspense } from 'react';
++import { Suspense, useEffect, useState } from 'react';
+ import { Outlet } from 'react-router-dom';
++import { DoDWarningDialog, useDoDWarningAcknowledged } from '@/components/auth/DoDWarningDialog';
+ import { LoadingState } from '@/components/ui/spinner';
+ import { Header } from './Header';
+ import { Sidebar } from './Sidebar';
+ 
+ export function AppLayout() {
++    const [acknowledged, setAcknowledged] = useState(useDoDWarningAcknowledged);
++
++    useEffect(() => {
++        function handleAck() {
++            setAcknowledged(true);
++        }
++        window.addEventListener('dod-warning-acknowledged', handleAck);
++        return () => window.removeEventListener('dod-warning-acknowledged', handleAck);
++    }, []);
++
+     return (
+         <div className="flex h-screen w-screen overflow-hidden bg-background">
++            {!acknowledged && <DoDWarningDialog />}
++
+             <Sidebar />
+ 
+             <div className="flex flex-1 flex-col overflow-hidden">
+                 <Header />
+ 
+                 <main className="flex-1 overflow-auto p-4">
+                     <Suspense fallback={<LoadingState />}>
+                         <Outlet />
+                     </Suspense>
+                 </main>
+             </div>
+         </div>
+     );
+ }
+diff --git a/frontend/src/components/scheduler/RefreshEventsButton.test.tsx b/frontend/src/components/scheduler/RefreshEventsButton.test.tsx
+new file mode 100644
+index 0000000..9de0a58
+--- /dev/null
++++ b/frontend/src/components/scheduler/RefreshEventsButton.test.tsx
+@@ -0,0 +1,55 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import * as eventDetailsApi from '@/services/eventDetailsApi';
++import { useSchedulerDataStore } from '@/stores/schedulerDataStore';
++import { useSchedulerPreferencesStore } from '@/stores/schedulerPreferencesStore';
++import { fireEvent, render, screen, waitFor } from '@/test/test-utils';
++import RefreshEventsButton from './RefreshEventsButton';
++
++vi.mock('@/services/eventDetailsApi');
++
++beforeEach(() => {
++    vi.clearAllMocks();
++    useSchedulerDataStore.setState({
++        visibleEventSourceIds: ['a'],
++        isLoadingEvents: false,
++        events: []
++    });
++    useSchedulerPreferencesStore.setState({ searchQuery: '' });
++    vi.mocked(eventDetailsApi.getEvents).mockResolvedValue([]);
++});
++
++describe('RefreshEventsButton', () => {
++    it('forces a server refresh for the range last fetched', async () => {
++        const range = {
++            start: new Date('2026-06-01T00:00:00Z'),
++            end: new Date('2026-06-30T23:59:59Z')
++        };
++        await useSchedulerDataStore.getState().refreshEvents(range);
++        expect(eventDetailsApi.getEvents).toHaveBeenLastCalledWith(
++            expect.not.objectContaining({ refresh: true })
++        );
++
++        render(<RefreshEventsButton />);
++        fireEvent.click(
++            screen.getByRole('button', { name: /refresh events/i })
++        );
++
++        await waitFor(() =>
++            expect(eventDetailsApi.getEvents).toHaveBeenCalledTimes(2)
++        );
++        expect(eventDetailsApi.getEvents).toHaveBeenLastCalledWith({
++            sourceIds: ['a'],
++            start: range.start.toISOString(),
++            end: range.end.toISOString(),
++            refresh: true
++        });
++    });
++
++    it('is disabled while events are loading', () => {
++        useSchedulerDataStore.setState({ isLoadingEvents: true });
++        render(<RefreshEventsButton />);
++        expect(
++            screen.getByRole('button', { name: /refresh events/i })
++        ).toBeDisabled();
++    });
++});
+diff --git a/frontend/src/components/scheduler/RefreshEventsButton.tsx b/frontend/src/components/scheduler/RefreshEventsButton.tsx
+new file mode 100644
+index 0000000..6737df5
+--- /dev/null
++++ b/frontend/src/components/scheduler/RefreshEventsButton.tsx
+@@ -0,0 +1,31 @@
++import { RefreshCw } from 'lucide-react';
++import { Button } from '@/components/ui/button';
++import { useSchedulerDataStore } from '@/stores/schedulerDataStore';
++
++/**
++ * Events are cached on the server per provider, so normal navigation does not
++ * re-query SharePoint, Outlook, etc. This button lets a user pull fresh data
++ * on demand.
++ */
++export default function RefreshEventsButton() {
++    const isLoadingEvents = useSchedulerDataStore((s) => s.isLoadingEvents);
++    const forceRefreshEvents = useSchedulerDataStore(
++        (s) => s.forceRefreshEvents
++    );
++
++    return (
++        <Button
++            variant="ghost"
++            size="icon"
++            className="h-8 w-8 text-muted-foreground hover:text-foreground"
++            onClick={() => void forceRefreshEvents()}
++            disabled={isLoadingEvents}
++            aria-label="Refresh events"
++            title="Refresh events from all sources"
++        >
++            <RefreshCw
++                className={`h-4 w-4 ${isLoadingEvents ? 'animate-spin' : ''}`}
++            />
++        </Button>
++    );
++}
+diff --git a/frontend/src/components/scheduler/SchedulerToolbar.tsx b/frontend/src/components/scheduler/SchedulerToolbar.tsx
+index 28cbcce..e76c707 100644
+--- a/frontend/src/components/scheduler/SchedulerToolbar.tsx
++++ b/frontend/src/components/scheduler/SchedulerToolbar.tsx
+@@ -1,141 +1,143 @@
+ import { ChevronDown, ChevronUp } from 'lucide-react';
+ import { useState } from 'react';
+ import SwimlaneModeToggle from '@/components/scheduler/SwimlaneModeToggle';
+ import TimeRangeSelector from '@/components/scheduler/TimeRangeSelector';
+ import ViewSelector from '@/components/scheduler/ViewSelector';
+ import { Button } from '@/components/ui/button';
+ import { Switch } from '@/components/ui/switch';
+ import { useSchedulerPreferencesStore } from '@/stores/schedulerPreferencesStore';
+ import DateNavigation from './DateNavigation';
+ import DateRangeSelector from './DateRangeSelector';
+ import EventSearch from './EventSearch';
+ import FullscreenToggle from './FullscreenToggle';
+ import OverlayLegend from './OverlayLegend';
++import RefreshEventsButton from './RefreshEventsButton';
+ import ZoomControls from './ZoomControls';
+ 
+ export default function SchedulerToolbar() {
+     const [isOpen, setIsOpen] = useState(false);
+     const isStackedMonthlyView = useSchedulerPreferencesStore(
+         (s) => s.isStackedMonthlyView
+     );
+     const isDailyAgendaView = useSchedulerPreferencesStore(
+         (s) => s.isDailyAgendaView
+     );
+     const setIsStackedMonthlyView = useSchedulerPreferencesStore(
+         (s) => s.setIsStackedMonthlyView
+     );
+     const stackedMonthCount = useSchedulerPreferencesStore(
+         (s) => s.stackedMonthCount
+     );
+     const setStackedMonthCount = useSchedulerPreferencesStore(
+         (s) => s.setStackedMonthCount
+     );
+ 
+     const handleToggleRibbon = (): void => setIsOpen((prev) => !prev);
+ 
+     const handleStackedToggle = (checked: boolean): void =>
+         setIsStackedMonthlyView(checked);
+ 
+     const handleMonthCountChange = (
+         event: React.ChangeEvent<HTMLInputElement>
+     ): void => {
+         const val = parseInt(event.target.value, 10);
+         if (!Number.isNaN(val)) setStackedMonthCount(val);
+     };
+ 
+     return (
+         <div className="flex flex-col border-b bg-background">
+             {/* Top Bar */}
+             <div className="flex items-center gap-1 px-3 py-2">
+                 <Button
+                     variant="ghost"
+                     size="icon"
+                     className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                     onClick={handleToggleRibbon}
+                     aria-label={isOpen ? 'Close ribbon' : 'Open ribbon'}
+                     aria-expanded={isOpen}
+                 >
+                     {isOpen ? (
+                         <ChevronUp className="h-4 w-4" />
+                     ) : (
+                         <ChevronDown className="h-4 w-4" />
+                     )}
+                 </Button>
+ 
+                 <div className="h-4 w-px bg-border mx-1" />
+ 
+                 <DateNavigation />
+ 
+                 <div className="h-4 w-px bg-border mx-1" />
+ 
+                 <DateRangeSelector />
+ 
+                 <div className="h-4 w-px bg-border mx-1" />
+ 
+                 {/* Zoom controls hidden when stacked monthly or daily agenda is active — neither uses day-column zoom */}
+                 {!isStackedMonthlyView && !isDailyAgendaView && (
+                     <ZoomControls />
+                 )}
+ 
+                 <div className="ml-auto flex items-center gap-2">
+                     <EventSearch />
++                    <RefreshEventsButton />
+                     <FullscreenToggle />
+                 </div>
+             </div>
+ 
+             {/* Expandable Ribbon Area */}
+             {isOpen && (
+                 <div className="bg-muted/10 border-t animate-in slide-in-from-top-1 fade-in duration-200">
+                     <div className="flex flex-wrap items-stretch gap-6 px-4 py-4 md:px-6">
+                         {/* Group: View Configuration */}
+                         <section
+                             aria-label="View Configuration"
+                             className="flex flex-col gap-3"
+                         >
+                             <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                                 View
+                             </h3>
+                             <div className="flex items-center h-full">
+                                 <ViewSelector />
+                             </div>
+                         </section>
+ 
+                         <div className="hidden sm:block w-px bg-border" />
+ 
+                         {/* Group: Swimlanes */}
+                         <section
+                             aria-label="Swimlanes"
+                             className="flex flex-col gap-3 min-w-[120px]"
+                         >
+                             <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                                 Swimlanes
+                             </h3>
+                             <SwimlaneModeToggle />
+                             <OverlayLegend />
+                         </section>
+ 
+                         <div className="hidden md:block w-px bg-border" />
+ 
+                         {/* Group: Advanced Options — stacked monthly toggle lives here,
+                             mirroring the Angular "Advanced View Options" config panel section */}
+                         <section
+                             aria-label="Advanced View Options"
+                             className="flex flex-col gap-3"
+                         >
+                             <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                                 Advanced Options
+                             </h3>
+ 
+                             <div className="flex flex-col gap-3">
+                                 {/* Stacked 30-day view toggle */}
+                                 <div className="flex items-center gap-2">
+                                     <Switch
+                                         id="stacked-monthly-toggle"
+                                         checked={isStackedMonthlyView}
+                                         onCheckedChange={handleStackedToggle}
+                                         aria-label="Stacked 30-day view"
+                                     />
+                                     <label
+                                         htmlFor="stacked-monthly-toggle"
+                                         className="text-sm font-medium text-foreground cursor-pointer select-none"
+                                     >
+diff --git a/frontend/src/components/ui/dialog.tsx b/frontend/src/components/ui/dialog.tsx
+index 669b22e..1151c0e 100644
+--- a/frontend/src/components/ui/dialog.tsx
++++ b/frontend/src/components/ui/dialog.tsx
+@@ -1,108 +1,112 @@
+ import * as DialogPrimitive from '@radix-ui/react-dialog';
+ import { X } from 'lucide-react';
+ import * as React from 'react';
+ 
+ import { cn } from '@/lib/utils';
+ 
+ const Dialog = DialogPrimitive.Root;
+ 
+ const DialogTrigger = DialogPrimitive.Trigger;
+ 
+ const DialogPortal = DialogPrimitive.Portal;
+ 
+ const DialogClose = DialogPrimitive.Close;
+ 
+ const DialogOverlay = React.forwardRef<
+     React.ElementRef<typeof DialogPrimitive.Overlay>,
+     React.ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>
+ >(({ className, ...props }, ref) => (
+     <DialogPrimitive.Overlay
+         ref={ref}
+         className={cn(
+             'fixed inset-0 z-50 bg-black/80 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
+             className
+         )}
+         {...props}
+     />
+ ));
+ DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
+ 
+ const DialogContent = React.forwardRef<
+     React.ElementRef<typeof DialogPrimitive.Content>,
+-    React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
+->(({ className, children, ...props }, ref) => (
++    React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
++        hideCloseButton?: boolean;
++    }
++>(({ className, children, hideCloseButton, ...props }, ref) => (
+     <DialogPortal>
+         <DialogOverlay />
+         <DialogPrimitive.Content
+             ref={ref}
+             className={cn(
+                 'fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg',
+                 className
+             )}
+             {...props}
+         >
+             {children}
+-            <DialogPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground">
+-                <X className="h-4 w-4" />
+-                <span className="sr-only">Close</span>
+-            </DialogPrimitive.Close>
++            {!hideCloseButton && (
++                <DialogPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground">
++                    <X className="h-4 w-4" />
++                    <span className="sr-only">Close</span>
++                </DialogPrimitive.Close>
++            )}
+         </DialogPrimitive.Content>
+     </DialogPortal>
+ ));
+ DialogContent.displayName = DialogPrimitive.Content.displayName;
+ 
+ const DialogHeader = ({
+     className,
+     ...props
+ }: React.HTMLAttributes<HTMLDivElement>) => (
+     <div
+         className={cn(
+             'flex flex-col space-y-1.5 text-center sm:text-left',
+             className
+         )}
+         {...props}
+     />
+ );
+ DialogHeader.displayName = 'DialogHeader';
+ 
+ const DialogFooter = ({
+     className,
+     ...props
+ }: React.HTMLAttributes<HTMLDivElement>) => (
+     <div
+         className={cn(
+             'flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2',
+             className
+         )}
+         {...props}
+     />
+ );
+ DialogFooter.displayName = 'DialogFooter';
+ 
+ const DialogTitle = React.forwardRef<
+     React.ElementRef<typeof DialogPrimitive.Title>,
+     React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
+ >(({ className, ...props }, ref) => (
+     <DialogPrimitive.Title
+         ref={ref}
+         className={cn(
+             'text-lg font-semibold leading-none tracking-tight',
+             className
+         )}
+         {...props}
+     />
+ ));
+ DialogTitle.displayName = DialogPrimitive.Title.displayName;
+ 
+ const DialogDescription = React.forwardRef<
+     React.ElementRef<typeof DialogPrimitive.Description>,
+     React.ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
+ >(({ className, ...props }, ref) => (
+     <DialogPrimitive.Description
+         ref={ref}
+         className={cn('text-sm text-muted-foreground', className)}
+         {...props}
+     />
+ ));
+ DialogDescription.displayName = DialogPrimitive.Description.displayName;
+ 
+diff --git a/frontend/src/lib/redirect.ts b/frontend/src/lib/redirect.ts
+new file mode 100644
+index 0000000..b5bdec7
+--- /dev/null
++++ b/frontend/src/lib/redirect.ts
+@@ -0,0 +1,4 @@
++/** Full-page navigation. Wrapped so tests can mock it (jsdom's location.assign is not spyable). */
++export function redirectTo(url: string): void {
++    window.location.assign(url);
++}
+diff --git a/frontend/src/services/axiosClient.test.ts b/frontend/src/services/axiosClient.test.ts
+index d9173ac..77f6d6c 100644
+--- a/frontend/src/services/axiosClient.test.ts
++++ b/frontend/src/services/axiosClient.test.ts
+@@ -1,270 +1,158 @@
+ import {
+     AxiosError,
+     AxiosHeaders,
+-    type AxiosResponse,
+     type InternalAxiosRequestConfig
+ } from 'axios';
+ import { toast } from 'sonner';
+ import { beforeEach, describe, expect, it, vi } from 'vitest';
+-import { useAuthStore } from '@/stores/authStore';
++import { redirectTo } from '@/lib/redirect';
+ import axiosClient from './axiosClient';
+ 
++vi.mock('@/lib/redirect', () => ({ redirectTo: vi.fn() }));
++
+ vi.mock('sonner', () => ({
+     toast: { error: vi.fn() }
+ }));
+ 
+ type InterceptorHandler<T> = {
+     fulfilled: (value: T) => T | Promise<T>;
+     rejected?: (error: unknown) => unknown;
+ };
+ 
+ const getRequestHandler = () => {
+     const handlers = (
+         axiosClient.interceptors.request as unknown as {
+             handlers: InterceptorHandler<InternalAxiosRequestConfig>[];
+         }
+     ).handlers;
+     return handlers[0]?.fulfilled;
+ };
+ 
+ const getResponseHandler = () => {
+     const handlers = (
+         axiosClient.interceptors.response as unknown as {
+             handlers: InterceptorHandler<unknown>[];
+         }
+     ).handlers;
+     return handlers[0]?.rejected;
+ };
+ 
+ describe('axiosClient interceptors', () => {
+     beforeEach(() => {
+         vi.clearAllMocks();
+-        useAuthStore.getState().clearAuthTokens();
+     });
+ 
+     it('sets default JSON headers on requests', async () => {
+         const handler = getRequestHandler();
+         const config: InternalAxiosRequestConfig = {
+             headers: new AxiosHeaders()
+         };
+ 
+         const result = await handler(config);
+ 
+         expect(result.headers.get('Accept')).toBe('application/json');
+         expect(result.headers.get('Content-Type')).toBe('application/json');
+     });
+ 
+     it('skips Content-Type for FormData payloads', async () => {
+         const handler = getRequestHandler();
+         const formData = new FormData();
+         const config: InternalAxiosRequestConfig = {
+             headers: new AxiosHeaders(),
+             data: formData
+         };
+ 
+         const result = await handler(config);
+ 
+         expect(result.headers.get('Accept')).toBe('application/json');
+         expect(result.headers.get('Content-Type')).toBeUndefined();
+     });
+ 
+-    it('updates Authorization header with the current access token', async () => {
+-        useAuthStore.getState().setAuthTokens({
+-            accessToken: 'test-token',
+-            refreshToken: 'refresh-token'
+-        });
+-
++    it('does not add an Authorization header', async () => {
+         const handler = getRequestHandler();
+         const config: InternalAxiosRequestConfig = {
+-            headers: new AxiosHeaders({
+-                Authorization: 'Bearer stale-token'
+-            })
+-        };
+-        const result = await handler(config);
+-
+-        expect(result.headers.get('Authorization')).toBe('Bearer test-token');
+-    });
+-
+-    it('refreshes a 401 response and retries with updated authorization', async () => {
+-        useAuthStore.getState().setAuthTokens({
+-            accessToken: 'expired-token',
+-            refreshToken: 'refresh-token'
+-        });
+-
+-        const refreshSpy = vi
+-            .spyOn(useAuthStore.getState(), 'refreshAccessToken')
+-            .mockImplementation(async () => {
+-                useAuthStore.getState().setAuthTokens({
+-                    accessToken: 'refreshed-token',
+-                    refreshToken: 'refresh-token'
+-                });
+-                return 'refreshed-token';
+-            });
+-        const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ({
+-            data: { success: true },
+-            status: 200,
+-            statusText: 'OK',
+-            headers: new AxiosHeaders(),
+-            config
+-        }));
+-        const requestConfig = {
+-            url: '/api/protected',
+-            method: 'get',
+-            headers: new AxiosHeaders({
+-                Authorization: 'Bearer expired-token'
+-            }),
+-            adapter
+-        } as InternalAxiosRequestConfig & { _retry?: boolean };
+-        const error = new AxiosError('Unauthorized');
+-        error.response = {
+-            status: 401,
+-            data: {},
+-            statusText: 'Unauthorized',
+-            headers: {},
+-            config: requestConfig
+-        };
+-        error.config = requestConfig;
+-
+-        const response = (await getResponseHandler()?.(error)) as AxiosResponse;
+-
+-        expect(response.data).toEqual({ success: true });
+-        expect(refreshSpy).toHaveBeenCalledOnce();
+-        expect(adapter).toHaveBeenCalledOnce();
+-        expect(requestConfig._retry).toBe(true);
+-        const retriedConfig = adapter.mock.calls[0]?.[0];
+-        expect(retriedConfig?.headers.get('Authorization')).toBe(
+-            'Bearer refreshed-token'
+-        );
+-        expect(toast.error).not.toHaveBeenCalled();
+-
+-        refreshSpy.mockRestore();
+-    });
+-
+-    it('does not refresh or retry a request more than once', async () => {
+-        const refreshSpy = vi.spyOn(
+-            useAuthStore.getState(),
+-            'refreshAccessToken'
+-        );
+-        const adapter = vi.fn();
+-        const requestConfig = {
+-            url: '/api/protected',
+-            method: 'get',
+-            headers: new AxiosHeaders(),
+-            adapter,
+-            _retry: true
+-        } as InternalAxiosRequestConfig & { _retry?: boolean };
+-        const error = new AxiosError('Unauthorized');
+-        error.response = {
+-            status: 401,
+-            data: {},
+-            statusText: 'Unauthorized',
+-            headers: {},
+-            config: requestConfig
++            headers: new AxiosHeaders()
+         };
+-        error.config = requestConfig;
+ 
+-        await expect(getResponseHandler()?.(error)).rejects.toBe(error);
+-
+-        expect(refreshSpy).not.toHaveBeenCalled();
+-        expect(adapter).not.toHaveBeenCalled();
++        const result = await handler(config);
+ 
+-        refreshSpy.mockRestore();
++        expect(result.headers.has('Authorization')).toBe(false);
+     });
+ 
+-    it('clears auth and redirects when token refresh fails', async () => {
+-        useAuthStore.getState().setAuthTokens({
+-            accessToken: 'old-token',
+-            refreshToken: 'refresh-token'
+-        });
+-
+-        const refreshSpy = vi
+-            .spyOn(useAuthStore.getState(), 'refreshAccessToken')
+-            .mockRejectedValue(new Error('refresh failed'));
+-        const clearSpy = vi.spyOn(useAuthStore.getState(), 'clearAuthTokens');
+-        const redirectSpy = vi
+-            .spyOn(useAuthStore.getState(), 'redirectToLogin')
+-            .mockImplementation(() => undefined);
++    it('redirects to /loggedoff on 401', async () => {
++        const assignSpy = vi.mocked(redirectTo);
+ 
+         const handler = getResponseHandler();
+         const error = new AxiosError('Unauthorized');
+         error.response = {
+             status: 401,
+             data: {},
+-            statusText: '',
++            statusText: 'Unauthorized',
+             headers: {},
+-            config: {} as never
++            config: { headers: new AxiosHeaders() } as never
+         };
+         error.config = {
+-            headers: new AxiosHeaders(),
+-            _retry: false
+-        } as InternalAxiosRequestConfig & { _retry?: boolean };
++            headers: new AxiosHeaders()
++        } as InternalAxiosRequestConfig;
+ 
+         await expect(handler?.(error)).rejects.toBe(error);
+-
+-        expect(clearSpy).toHaveBeenCalled();
+-        expect(redirectSpy).toHaveBeenCalled();
+-        expect(toast.error).toHaveBeenCalledWith(
+-            'Your session has expired. Please sign in again.'
+-        );
+-
+-        refreshSpy.mockRestore();
+-        clearSpy.mockRestore();
+-        redirectSpy.mockRestore();
++        expect(assignSpy).toHaveBeenCalledWith('/loggedoff');
++        expect(toast.error).not.toHaveBeenCalled();
+     });
+ 
+     it('shows API error field when message is absent', async () => {
+         const handler = getResponseHandler();
+         const error = new AxiosError('Bad Request');
+         error.response = {
+             status: 400,
+             data: { error: 'Validation failed' },
+             statusText: '',
+             headers: {},
+             config: {} as never
+         };
+         error.config = {
+             headers: new AxiosHeaders()
+         } as InternalAxiosRequestConfig;
+ 
+         await expect(handler?.(error)).rejects.toBe(error);
+         expect(toast.error).toHaveBeenCalledWith('Validation failed');
+     });
+ 
+     it('shows API error message from response payload', async () => {
+         const handler = getResponseHandler();
+         const error = new AxiosError('Bad Request');
+         error.response = {
+             status: 400,
+             data: { message: 'Invalid payload' },
+             statusText: '',
+             headers: {},
+             config: {} as never
+         };
+         error.config = {
+             headers: new AxiosHeaders()
+         } as InternalAxiosRequestConfig;
+ 
+         await expect(handler?.(error)).rejects.toBe(error);
+         expect(toast.error).toHaveBeenCalledWith('Invalid payload');
+     });
+ 
+     it('falls back to generic error message', async () => {
+         const handler = getResponseHandler();
+         const error = new AxiosError('Server Error');
+         error.response = {
+             status: 500,
+             data: {},
+             statusText: '',
+             headers: {},
+             config: {} as never
+         };
+         error.config = {
+             headers: new AxiosHeaders()
+         } as InternalAxiosRequestConfig;
+ 
+         await expect(handler?.(error)).rejects.toBe(error);
+         expect(toast.error).toHaveBeenCalledWith(
+             'Request failed. Please try again.'
+         );
+     });
+ });
+diff --git a/frontend/src/services/axiosClient.ts b/frontend/src/services/axiosClient.ts
+index f34b467..f39b22f 100644
+--- a/frontend/src/services/axiosClient.ts
++++ b/frontend/src/services/axiosClient.ts
+@@ -1,93 +1,53 @@
+ import axios, {
+     AxiosError,
+     AxiosHeaders,
+     type InternalAxiosRequestConfig
+ } from 'axios';
+ import { toast } from 'sonner';
+-import { useAuthStore } from '@/stores/authStore';
++import { redirectTo } from '@/lib/redirect';
+ 
+ interface ApiErrorPayload {
+     message?: string;
+     error?: string;
+ }
+ 
+-interface RetriableRequestConfig extends InternalAxiosRequestConfig {
+-    _retry?: boolean;
+-}
+-
+ const readApiErrorMessage = (error: AxiosError<ApiErrorPayload>): string => {
+     const messageFromPayload = error.response?.data?.message;
+-    if (messageFromPayload) {
+-        return messageFromPayload;
+-    }
+-
++    if (messageFromPayload) return messageFromPayload;
+     const errorFromPayload = error.response?.data?.error;
+-    if (errorFromPayload) {
+-        return errorFromPayload;
+-    }
+-
++    if (errorFromPayload) return errorFromPayload;
+     return 'Request failed. Please try again.';
+ };
+ 
+ const ensureDefaultHeaders = (config: InternalAxiosRequestConfig) => {
+     const nextHeaders = new AxiosHeaders(config.headers);
+     nextHeaders.set('Accept', 'application/json');
+-
+     if (!(config.data instanceof FormData)) {
+         nextHeaders.set('Content-Type', 'application/json');
+     }
+-
+     config.headers = nextHeaders;
+ };
+ 
+ const axiosClient = axios.create({
+     baseURL: import.meta.env?.VITE_API_BASE_URL || ''
+ });
+ 
+ axiosClient.interceptors.request.use((config) => {
+     ensureDefaultHeaders(config);
+-
+-    const token = useAuthStore.getState().getAccessToken();
+-    if (token) {
+-        const nextHeaders = new AxiosHeaders(config.headers);
+-        nextHeaders.set('Authorization', `Bearer ${token}`);
+-        config.headers = nextHeaders;
+-    }
+-
+     return config;
+ });
+ 
+ axiosClient.interceptors.response.use(
+     (response) => response,
+-    async (error: AxiosError<ApiErrorPayload>) => {
+-        const requestConfig = error.config as
+-            | RetriableRequestConfig
+-            | undefined;
+-        const status = error.response?.status;
+-
+-        if (status === 401 && requestConfig && !requestConfig._retry) {
+-            requestConfig._retry = true;
+-
+-            try {
+-                const refreshedToken = await useAuthStore
+-                    .getState()
+-                    .refreshAccessToken();
+-                const nextHeaders = new AxiosHeaders(requestConfig.headers);
+-                nextHeaders.set('Authorization', `Bearer ${refreshedToken}`);
+-                requestConfig.headers = nextHeaders;
+-                return axiosClient(requestConfig);
+-            } catch {
+-                useAuthStore.getState().clearAuthTokens();
+-                useAuthStore.getState().redirectToLogin();
+-                toast.error('Your session has expired. Please sign in again.');
+-                return Promise.reject(error);
+-            }
++    (error: AxiosError<ApiErrorPayload>) => {
++        if (error.response?.status === 401) {
++            redirectTo('/loggedoff');
++            return Promise.reject(error);
+         }
+-
+         const message = readApiErrorMessage(error);
+         toast.error(message);
+         return Promise.reject(error);
+     }
+ );
+ 
+ export default axiosClient;
+diff --git a/frontend/src/services/eventDetailsApi.ts b/frontend/src/services/eventDetailsApi.ts
+index 6debf79..6fec4cd 100644
+--- a/frontend/src/services/eventDetailsApi.ts
++++ b/frontend/src/services/eventDetailsApi.ts
+@@ -1,27 +1,32 @@
+ import type { EventDetail, EventDetailsQuery } from '@/types';
+ import axiosClient from './axiosClient';
+ 
+ const endpoint = '/api/eventdetails';
+ 
+ export const getEvents = async ({
+     sourceIds,
+     start,
+-    end
++    end,
++    refresh
+ }: EventDetailsQuery): Promise<EventDetail[]> => {
+     const params = new URLSearchParams();
+ 
+     for (const sourceId of sourceIds) {
+         params.append('source_ids', sourceId);
+     }
+ 
+     if (start) {
+         params.set('start', start);
+     }
+ 
+     if (end) {
+         params.set('end', end);
+     }
+ 
++    if (refresh) {
++        params.set('refresh', 'true');
++    }
++
+     const { data } = await axiosClient.get<EventDetail[]>(endpoint, { params });
+     return data;
+ };
+diff --git a/frontend/src/stores/authStore.test.ts b/frontend/src/stores/authStore.test.ts
+index 8798e88..37dc3c1 100644
+--- a/frontend/src/stores/authStore.test.ts
++++ b/frontend/src/stores/authStore.test.ts
+@@ -1,99 +1,23 @@
+-import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { describe, expect, it, vi } from 'vitest';
++import { redirectTo } from '@/lib/redirect';
+ import { useAuthStore } from './authStore';
+ 
+-describe('useAuthStore', () => {
+-    beforeEach(() => {
+-        useAuthStore.setState({
+-            accessToken: '',
+-            refreshToken: ''
+-        });
+-        vi.clearAllMocks();
+-    });
+-
+-    describe('token management', () => {
+-        it('initializes with empty tokens', () => {
+-            const state = useAuthStore.getState();
+-            expect(state.accessToken).toBe('');
+-            expect(state.refreshToken).toBe('');
+-        });
+-
+-        it('sets auth tokens', () => {
+-            const { setAuthTokens } = useAuthStore.getState();
+-
+-            setAuthTokens({
+-                accessToken: 'access-123',
+-                refreshToken: 'refresh-456'
+-            });
+-
+-            const state = useAuthStore.getState();
+-            expect(state.accessToken).toBe('access-123');
+-            expect(state.refreshToken).toBe('refresh-456');
+-        });
+-
+-        it('clears auth tokens', () => {
+-            const { setAuthTokens, clearAuthTokens } = useAuthStore.getState();
+-
+-            setAuthTokens({
+-                accessToken: 'access-123',
+-                refreshToken: 'refresh-456'
+-            });
+-
+-            let state = useAuthStore.getState();
+-            expect(state.accessToken).toBe('access-123');
+-
+-            clearAuthTokens();
+-            state = useAuthStore.getState();
+-            expect(state.accessToken).toBe('');
+-            expect(state.refreshToken).toBe('');
+-        });
+-
+-        it('returns current access token via getter', () => {
+-            const { setAuthTokens, getAccessToken } = useAuthStore.getState();
+-
+-            setAuthTokens({
+-                accessToken: 'token-value',
+-                refreshToken: 'refresh-token'
+-            });
+-
+-            expect(getAccessToken()).toBe('token-value');
+-        });
+-    });
+-
+-    describe('persistence', () => {
+-        it('persists only tokens to localStorage', () => {
+-            const { setAuthTokens } = useAuthStore.getState();
+-
+-            setAuthTokens({
+-                accessToken: 'access-token',
+-                refreshToken: 'refresh-token'
+-            });
+-
+-            const stored = localStorage.getItem('slate-auth-store');
+-            expect(stored).toBeTruthy();
+-
+-            const parsed = JSON.parse(stored || '{}');
+-            expect(parsed.state).toEqual({
+-                accessToken: 'access-token',
+-                refreshToken: 'refresh-token'
+-            });
+-        });
+-    });
+-
+-    describe('error handling', () => {
+-        it('throws error when no refresh token available', async () => {
+-            const { refreshAccessToken } = useAuthStore.getState();
++vi.mock('@/lib/redirect', () => ({ redirectTo: vi.fn() }));
+ 
+-            await expect(refreshAccessToken()).rejects.toThrow(
+-                'Missing refresh token.'
+-            );
+-        });
+-    });
+-
+-    describe('redirect to login', () => {
++describe('useAuthStore', () => {
++    describe('redirectToLogin', () => {
+         it('has redirectToLogin method', () => {
+             const { redirectToLogin } = useAuthStore.getState();
+             expect(redirectToLogin).toBeDefined();
+             expect(typeof redirectToLogin).toBe('function');
+         });
++
++        it('redirects to /loggedoff', () => {
++            const assignSpy = vi.mocked(redirectTo);
++
++            useAuthStore.getState().redirectToLogin();
++
++            expect(assignSpy).toHaveBeenCalledWith('/loggedoff');
++        });
+     });
+ });
+diff --git a/frontend/src/stores/authStore.ts b/frontend/src/stores/authStore.ts
+index aa119e4..5a42242 100644
+--- a/frontend/src/stores/authStore.ts
++++ b/frontend/src/stores/authStore.ts
+@@ -1,92 +1,12 @@
+ import { create } from 'zustand';
+-import { persist } from 'zustand/middleware';
++import { redirectTo } from '@/lib/redirect';
+ 
+-interface AuthTokens {
+-    accessToken: string;
+-    refreshToken: string;
+-}
+-
+-interface AuthState extends AuthTokens {
+-    setAuthTokens: (tokens: AuthTokens) => void;
+-    clearAuthTokens: () => void;
+-    getAccessToken: () => string;
+-    refreshAccessToken: () => Promise<string>;
++interface AuthState {
+     redirectToLogin: () => void;
+ }
+ 
+-const REFRESH_PATH = import.meta.env?.VITE_AUTH_REFRESH_PATH || '/auth/refresh';
+-
+-let refreshPromise: Promise<string> | null = null;
+-
+-const createRefreshRequest = async (refreshToken: string): Promise<string> => {
+-    const response = await fetch(
+-        `${import.meta.env?.VITE_API_BASE_URL ?? ''}${REFRESH_PATH}`,
+-        {
+-            method: 'POST',
+-            headers: {
+-                'Content-Type': 'application/json',
+-                Accept: 'application/json'
+-            },
+-            body: JSON.stringify({ refreshToken })
+-        }
+-    );
+-
+-    if (!response.ok) {
+-        throw new Error('Unable to refresh access token.');
+-    }
+-
+-    const payload = (await response.json()) as Partial<AuthTokens>;
+-
+-    if (!payload.accessToken) {
+-        throw new Error('Refresh endpoint did not return an access token.');
++export const useAuthStore = create<AuthState>()(() => ({
++    redirectToLogin: () => {
++        redirectTo('/loggedoff');
+     }
+-
+-    const nextRefreshToken = payload.refreshToken ?? refreshToken;
+-    useAuthStore.getState().setAuthTokens({
+-        accessToken: payload.accessToken,
+-        refreshToken: nextRefreshToken
+-    });
+-
+-    return payload.accessToken;
+-};
+-
+-export const useAuthStore = create<AuthState>()(
+-    persist(
+-        (set, get) => ({
+-            accessToken: '',
+-            refreshToken: '',
+-            setAuthTokens: ({ accessToken, refreshToken }) =>
+-                set({ accessToken, refreshToken }),
+-            clearAuthTokens: () => set({ accessToken: '', refreshToken: '' }),
+-            getAccessToken: () => get().accessToken,
+-            refreshAccessToken: async () => {
+-                if (refreshPromise) {
+-                    return refreshPromise;
+-                }
+-
+-                const { refreshToken } = get();
+-                if (!refreshToken) {
+-                    throw new Error('Missing refresh token.');
+-                }
+-
+-                refreshPromise = createRefreshRequest(refreshToken).finally(
+-                    () => {
+-                        refreshPromise = null;
+-                    }
+-                );
+-
+-                return refreshPromise;
+-            },
+-            redirectToLogin: () => {
+-                window.location.assign('/loggedoff');
+-            }
+-        }),
+-        {
+-            name: 'slate-auth-store',
+-            partialize: ({ accessToken, refreshToken }) => ({
+-                accessToken,
+-                refreshToken
+-            })
+-        }
+-    )
+-);
++}));
+diff --git a/frontend/src/stores/schedulerDataStore.ts b/frontend/src/stores/schedulerDataStore.ts
+index 495444a..071be2a 100644
+--- a/frontend/src/stores/schedulerDataStore.ts
++++ b/frontend/src/stores/schedulerDataStore.ts
+@@ -5,186 +5,200 @@ import * as eventDetailsApi from '@/services/eventDetailsApi';
+ import * as eventSourcesApi from '@/services/eventSourcesApi';
+ import {
+     type SchedulerRange,
+     useSchedulerPreferencesStore,
+     ZOOM_STEPS
+ } from '@/stores/schedulerPreferencesStore';
+ import type { EventDetail, EventDetailSource } from '@/types';
+ 
+ interface RangeInputs {
+     rangeStartDate: Date | null;
+     rangeEndDate: Date | null;
+     activeDate: Date;
+     calendarZoomIndex: number;
+ }
+ 
+ const calculateTargetRange = (
+     state: RangeInputs,
+     override?: SchedulerRange
+ ): SchedulerRange => {
+     if (override) return override;
+ 
+     const { rangeStartDate, rangeEndDate, activeDate, calendarZoomIndex } =
+         state;
+ 
+     if (rangeStartDate && rangeEndDate && rangeStartDate <= rangeEndDate) {
+         return {
+             start: startOfDay(rangeStartDate),
+             end: endOfDay(rangeEndDate)
+         };
+     }
+ 
+     // Clamp out-of-range indexes instead of letting ZOOM_STEPS[...] resolve
+     // to undefined and throw on .days.
+     const safeZoomIndex = Math.min(
+         Math.max(calendarZoomIndex, 0),
+         ZOOM_STEPS.length - 1
+     );
+     const days = ZOOM_STEPS[safeZoomIndex].days;
+     const base = rangeStartDate ?? activeDate;
+     return {
+         start: startOfDay(base),
+         end: endOfDay(addDays(base, days - 1))
+     };
+ };
+ 
+ const rehydrateStore = (
+     persisted: unknown,
+     current: SchedulerDataState
+ ): SchedulerDataState => {
+     const data = persisted as Partial<SchedulerDataState> | undefined;
+     if (!data) return current;
+ 
+     return {
+         ...current,
+         visibleEventSourceIds: Array.isArray(data.visibleEventSourceIds)
+             ? data.visibleEventSourceIds
+             : current.visibleEventSourceIds
+     };
+ };
+ 
++// The view-scoped range of the most recent fetch (see SlatePage), so a manual
++// refresh reloads exactly what is on screen.
++let lastRangeOverride: SchedulerRange | undefined;
++
+ export interface SchedulerDataState {
+     visibleEventSourceIds: string[];
+     isLoadingSources: boolean;
+     isLoadingEvents: boolean;
+     sourcesError: string | null;
+     eventsError: string | null;
+     eventSources: EventDetailSource[];
+     events: EventDetail[];
+     setVisibleEventSourceIds: (ids: string[]) => void;
+     toggleVisibleEventSourceId: (id: string) => void;
+     loadEventSources: () => Promise<void>;
+-    refreshEvents: (override?: SchedulerRange) => Promise<void>;
++    refreshEvents: (
++        override?: SchedulerRange,
++        options?: { force?: boolean }
++    ) => Promise<void>;
++    /** Re-query the providers for the range currently on screen, skipping the server cache. */
++    forceRefreshEvents: () => Promise<void>;
+     clearEvents: () => void;
+ }
+ 
+ export const useSchedulerDataStore = create<SchedulerDataState>()(
+     persist(
+         (set, get) => ({
+             visibleEventSourceIds: [],
+             isLoadingSources: false,
+             isLoadingEvents: false,
+             sourcesError: null,
+             eventsError: null,
+             eventSources: [],
+             events: [],
+ 
+             setVisibleEventSourceIds: (ids) =>
+                 set({ visibleEventSourceIds: [...new Set(ids)] }),
+ 
+             toggleVisibleEventSourceId: (sourceId) => {
+                 const current = get().visibleEventSourceIds;
+                 const next = current.includes(sourceId)
+                     ? current.filter((id) => id !== sourceId)
+                     : [...current, sourceId];
+                 set({ visibleEventSourceIds: next });
+             },
+ 
+             loadEventSources: async () => {
+                 if (get().isLoadingSources) return;
+                 set({ isLoadingSources: true, sourcesError: null });
+                 try {
+                     const sources = await eventSourcesApi.getAll();
+                     set({ eventSources: sources });
+                     if (get().visibleEventSourceIds.length === 0) {
+                         set({
+                             visibleEventSourceIds: sources
+                                 .filter((s) => s.isActive)
+                                 .map((s) => s.id)
+                         });
+                     }
+                 } catch (err) {
+                     set({
+                         sourcesError:
+                             err instanceof Error
+                                 ? err.message
+                                 : 'Failed to load sources'
+                     });
+                 } finally {
+                     set({ isLoadingSources: false });
+                 }
+             },
+ 
+-            refreshEvents: async (rangeOverride) => {
++            refreshEvents: async (rangeOverride, options) => {
+                 if (get().isLoadingEvents) return;
++                lastRangeOverride = rangeOverride;
+ 
+                 // While a global search is active, fetch every active source
+                 // (not just the ones toggled visible) so matching events from
+                 // hidden calendars can surface their swimlane in the results.
+                 const hasSearchQuery =
+                     useSchedulerPreferencesStore.getState().searchQuery.trim()
+                         .length > 0;
+                 const sourceIds = hasSearchQuery
+                     ? get()
+                           .eventSources.filter((s) => s.isActive)
+                           .map((s) => s.id)
+                     : get().visibleEventSourceIds;
+ 
+                 if (sourceIds.length === 0) {
+                     set({ events: [] });
+                     return;
+                 }
+ 
+                 // Reads rangeStartDate/rangeEndDate/activeDate/calendarZoomIndex from
+                 // the preferences store — refreshEvents depends on that store's shape,
+                 // so check both stores if either one's fields change.
+                 set({ isLoadingEvents: true, eventsError: null });
+ 
+                 try {
+                     const range = calculateTargetRange(
+                         useSchedulerPreferencesStore.getState(),
+                         rangeOverride
+                     );
+                     const events = await eventDetailsApi.getEvents({
+                         sourceIds,
+                         start: range.start.toISOString(),
+-                        end: range.end.toISOString()
++                        end: range.end.toISOString(),
++                        ...(options?.force ? { refresh: true } : {})
+                     });
+                     set({ events });
+                 } catch (err) {
+                     set({
+                         eventsError:
+                             err instanceof Error
+                                 ? err.message
+                                 : 'Failed to load events'
+                     });
+                 } finally {
+                     set({ isLoadingEvents: false });
+                 }
+             },
+ 
++            forceRefreshEvents: () =>
++                get().refreshEvents(lastRangeOverride, { force: true }),
++
+             clearEvents: () => set({ events: [] })
+         }),
+         {
+             // Deliberately a new key, not the preferences store's
+             // 'slate-scheduler-store' — visibleEventSourceIds used to live there.
+             // Existing users' calendar-visibility selection resets once on first
+             // load after this ships (loadEventSources already defaults to "all
+             // active sources" whenever the list is empty), then persists normally.
+             name: 'slate-scheduler-data-store',
+             partialize: (s) => ({
+                 visibleEventSourceIds: s.visibleEventSourceIds
+             }),
+             merge: (persisted, current) => rehydrateStore(persisted, current)
+         }
+     )
+ );
+diff --git a/frontend/src/stores/schedulerPreferencesStore.test.ts b/frontend/src/stores/schedulerPreferencesStore.test.ts
+index 8f93900..11cc8ed 100644
+--- a/frontend/src/stores/schedulerPreferencesStore.test.ts
++++ b/frontend/src/stores/schedulerPreferencesStore.test.ts
+@@ -50,254 +50,247 @@ describe('getRangeForView', () => {
+     it('day: start and end are boundaries of the same day', () => {
+         const { start, end } = getRangeForView(date, 'day');
+         expect(start).toEqual(startOfDay(date));
+         expect(end).toEqual(endOfDay(date));
+     });
+ 
+     it('week: spans Sun-Sat of the week containing the date', () => {
+         const { start, end } = getRangeForView(date, 'week');
+         const normalised = startOfDay(date);
+         expect(start).toEqual(startOfWeek(normalised, { weekStartsOn: 0 }));
+         expect(end).toEqual(
+             endOfDay(endOfWeek(normalised, { weekStartsOn: 0 }))
+         );
+     });
+ 
+     it('agenda: spans 30 days from start of day', () => {
+         const { start, end } = getRangeForView(date, 'agenda');
+         expect(start).toEqual(startOfDay(date));
+         expect(end).toEqual(endOfDay(addDays(date, 30)));
+     });
+ 
+     it('month: spans 41 days from start of day', () => {
+         const { start, end } = getRangeForView(date, 'month');
+         expect(start).toEqual(startOfDay(date));
+         expect(end).toEqual(endOfDay(addDays(date, 41)));
+     });
+ });
+ 
+ /* ------------------------------------------------------------------ */
+ /* Store actions — synchronous state mutations only                   */
+ /* ------------------------------------------------------------------ */
+ 
+ describe('useSchedulerPreferencesStore — setActiveViewId', () => {
+     it('accepts valid view ids', () => {
+         const { setActiveViewId } = useSchedulerPreferencesStore.getState();
+ 
+         for (const id of ['day', 'week', 'month', 'agenda'] as const) {
+             setActiveViewId(id);
+             expect(useSchedulerPreferencesStore.getState().activeViewId).toBe(
+                 id
+             );
+         }
+     });
+ 
+     it('falls back to month for an invalid value', () => {
+         useSchedulerPreferencesStore
+             .getState()
+             .setActiveViewId('invalid' as never);
+         expect(useSchedulerPreferencesStore.getState().activeViewId).toBe(
+             'month'
+         );
+     });
+ });
+ 
+ describe('useSchedulerPreferencesStore — setZoomLevel', () => {
+     it('accepts valid zoom levels', () => {
+         const { setZoomLevel } = useSchedulerPreferencesStore.getState();
+ 
+         for (const lvl of ['compact', 'normal', 'comfortable'] as const) {
+             setZoomLevel(lvl);
+-            expect(useSchedulerPreferencesStore.getState().zoomLevel).toBe(
+-                lvl
+-            );
++            expect(useSchedulerPreferencesStore.getState().zoomLevel).toBe(lvl);
+         }
+     });
+ 
+     it('falls back to normal for an invalid value', () => {
+-        useSchedulerPreferencesStore
+-            .getState()
+-            .setZoomLevel('huge' as never);
++        useSchedulerPreferencesStore.getState().setZoomLevel('huge' as never);
+         expect(useSchedulerPreferencesStore.getState().zoomLevel).toBe(
+             'normal'
+         );
+     });
+ });
+ 
+ describe('useSchedulerPreferencesStore — shiftDate', () => {
+     it('today: resets activeDate to the current instant', () => {
+         const now = new Date('2025-06-15T08:00:00.000Z');
+         vi.useFakeTimers({ now });
+ 
+         useSchedulerPreferencesStore.setState({
+             activeDate: new Date('2020-01-01')
+         });
+         useSchedulerPreferencesStore.getState().shiftDate('today');
+ 
+-        expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(
+-            now
+-        );
++        expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(now);
+     });
+ 
+     it('next: advances by 1 day when view is "day"', () => {
+         const base = new Date('2025-06-15');
+         useSchedulerPreferencesStore.setState({
+             activeDate: base,
+             activeViewId: 'day'
+         });
+         useSchedulerPreferencesStore.getState().shiftDate('next');
+         expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(
+             addDays(base, 1)
+         );
+     });
+ 
+     it('prev: retreats by 7 days when view is "week"', () => {
+         const base = new Date('2025-06-15');
+         useSchedulerPreferencesStore.setState({
+             activeDate: base,
+             activeViewId: 'week'
+         });
+         useSchedulerPreferencesStore.getState().shiftDate('prev');
+         expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(
+             addDays(base, -7)
+         );
+     });
+ 
+     it('next: advances by 30 days when view is "month"', () => {
+         const base = new Date('2025-06-15');
+         useSchedulerPreferencesStore.setState({
+             activeDate: base,
+             activeViewId: 'month'
+         });
+         useSchedulerPreferencesStore.getState().shiftDate('next');
+         expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(
+             addDays(base, 30)
+         );
+     });
+ 
+     it('next: advances by exactly 1 day when daily agenda view is active, regardless of activeViewId', () => {
+         const base = new Date('2025-06-15');
+         useSchedulerPreferencesStore.setState({
+             activeDate: base,
+             activeViewId: 'month',
+             isDailyAgendaView: true
+         });
+         useSchedulerPreferencesStore.getState().shiftDate('next');
+         expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(
+             addDays(base, 1)
+         );
+     });
+ 
+     it('prev: retreats by exactly 1 day when daily agenda view is active, regardless of activeViewId', () => {
+         const base = new Date('2025-06-15');
+         useSchedulerPreferencesStore.setState({
+             activeDate: base,
+             activeViewId: 'week',
+             isDailyAgendaView: true
+         });
+         useSchedulerPreferencesStore.getState().shiftDate('prev');
+         expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(
+             addDays(base, -1)
+         );
+     });
+ 
+     it('today: resets activeDate even when daily agenda view is active', () => {
+         const now = new Date('2025-06-15T08:00:00.000Z');
+         vi.useFakeTimers({ now });
+ 
+         useSchedulerPreferencesStore.setState({
+             activeDate: new Date('2020-01-01'),
+             isDailyAgendaView: true
+         });
+         useSchedulerPreferencesStore.getState().shiftDate('today');
+ 
+-        expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(
+-            now
+-        );
++        expect(useSchedulerPreferencesStore.getState().activeDate).toEqual(now);
+     });
+ });
+ 
+ describe('useSchedulerPreferencesStore — setIsOverlayMode', () => {
+     it('sets isOverlayMode to true', () => {
+         useSchedulerPreferencesStore.getState().setIsOverlayMode(true);
+         expect(useSchedulerPreferencesStore.getState().isOverlayMode).toBe(
+             true
+         );
+     });
+ 
+     it('sets isOverlayMode to false', () => {
+         useSchedulerPreferencesStore.setState({ isOverlayMode: true });
+         useSchedulerPreferencesStore.getState().setIsOverlayMode(false);
+         expect(useSchedulerPreferencesStore.getState().isOverlayMode).toBe(
+             false
+         );
+     });
+ });
+ 
+ describe('useSchedulerPreferencesStore — setSwimlaneOrder', () => {
+     it('replaces swimlaneOrder with the provided array', () => {
+         useSchedulerPreferencesStore
+             .getState()
+             .setSwimlaneOrder(['src-b', 'src-a']);
+-        expect(useSchedulerPreferencesStore.getState().swimlaneOrder).toEqual(
+-            ['src-b', 'src-a']
+-        );
++        expect(useSchedulerPreferencesStore.getState().swimlaneOrder).toEqual([
++            'src-b',
++            'src-a'
++        ]);
+     });
+ 
+     it('accepts an empty array, clearing the order', () => {
+         useSchedulerPreferencesStore.setState({ swimlaneOrder: ['src-a'] });
+         useSchedulerPreferencesStore.getState().setSwimlaneOrder([]);
+         expect(useSchedulerPreferencesStore.getState().swimlaneOrder).toEqual(
+             []
+         );
+     });
+ });
+ 
+ describe('useSchedulerPreferencesStore — setActiveTimeRange', () => {
+     it('sets all fields and derives activeDate from the start string', () => {
+         useSchedulerPreferencesStore
+             .getState()
+             .setActiveTimeRange(
+                 'range-1',
+                 '2025-03-01T00:00:00.000Z',
+                 '2025-03-31T23:59:59.000Z'
+             );
+         const state = useSchedulerPreferencesStore.getState();
+         expect(state.activeTimeRangeId).toBe('range-1');
+         expect(state.rangeStartDate).toEqual(
+             new Date('2025-03-01T00:00:00.000Z')
+         );
+         expect(state.rangeEndDate).toEqual(
+             new Date('2025-03-31T23:59:59.000Z')
+         );
+         expect(state.activeDate).toEqual(new Date('2025-03-01T00:00:00.000Z'));
+     });
+ 
+     it('clears date fields when null strings are passed', () => {
+         useSchedulerPreferencesStore.setState({
+             activeTimeRangeId: 'old',
+             rangeStartDate: new Date(),
+             rangeEndDate: new Date()
+         });
+         useSchedulerPreferencesStore
+             .getState()
+             .setActiveTimeRange(null, null, null);
+         const state = useSchedulerPreferencesStore.getState();
+         expect(state.activeTimeRangeId).toBeNull();
+         expect(state.rangeStartDate).toBeNull();
+         expect(state.rangeEndDate).toBeNull();
+     });
+ });
+ 
+ describe('useSchedulerPreferencesStore — setCustomDateRange', () => {
+     it('sets rangeStartDate and activeDate, clears rangeEndDate and activeTimeRangeId', () => {
+         useSchedulerPreferencesStore.setState({
+             rangeEndDate: new Date(),
+             activeTimeRangeId: 'some-id'
+         });
+         const start = new Date('2025-05-01');
+         useSchedulerPreferencesStore.getState().setCustomDateRange(start);
+         const state = useSchedulerPreferencesStore.getState();
+         expect(state.rangeStartDate).toEqual(start);
+         expect(state.activeDate).toEqual(start);
+         expect(state.rangeEndDate).toBeNull();
+         expect(state.activeTimeRangeId).toBeNull();
+@@ -327,169 +320,169 @@ describe('useSchedulerPreferencesStore — zoomIn / zoomOut', () => {
+         useSchedulerPreferencesStore.setState({ calendarZoomIndex: 3 });
+         useSchedulerPreferencesStore.getState().zoomOut();
+         expect(useSchedulerPreferencesStore.getState().calendarZoomIndex).toBe(
+             4
+         );
+     });
+ 
+     it('zoomIn does not go below 0', () => {
+         useSchedulerPreferencesStore.setState({ calendarZoomIndex: 0 });
+         useSchedulerPreferencesStore.getState().zoomIn();
+         expect(useSchedulerPreferencesStore.getState().calendarZoomIndex).toBe(
+             0
+         );
+     });
+ 
+     it('zoomOut does not exceed the last ZOOM_STEPS index', () => {
+         useSchedulerPreferencesStore.setState({
+             calendarZoomIndex: ZOOM_STEPS.length - 1
+         });
+         useSchedulerPreferencesStore.getState().zoomOut();
+         expect(useSchedulerPreferencesStore.getState().calendarZoomIndex).toBe(
+             ZOOM_STEPS.length - 1
+         );
+     });
+ });
+ 
+ /* ------------------------------------------------------------------ */
+ /* setIsStackedMonthlyView                                             */
+ /* ------------------------------------------------------------------ */
+ 
+ describe('useSchedulerPreferencesStore — setIsStackedMonthlyView', () => {
+     it('sets isStackedMonthlyView to true', () => {
+         useSchedulerPreferencesStore.getState().setIsStackedMonthlyView(true);
+         expect(
+             useSchedulerPreferencesStore.getState().isStackedMonthlyView
+         ).toBe(true);
+     });
+ 
+     it('sets isStackedMonthlyView to false', () => {
+         useSchedulerPreferencesStore.setState({ isStackedMonthlyView: true });
+         useSchedulerPreferencesStore.getState().setIsStackedMonthlyView(false);
+         expect(
+             useSchedulerPreferencesStore.getState().isStackedMonthlyView
+         ).toBe(false);
+     });
+ 
+     it('turns off isDailyAgendaView when enabled (mutually exclusive layouts)', () => {
+         useSchedulerPreferencesStore.setState({ isDailyAgendaView: true });
+         useSchedulerPreferencesStore.getState().setIsStackedMonthlyView(true);
+         const state = useSchedulerPreferencesStore.getState();
+         expect(state.isStackedMonthlyView).toBe(true);
+         expect(state.isDailyAgendaView).toBe(false);
+     });
+ 
+     it('does not disturb isDailyAgendaView when disabled', () => {
+         useSchedulerPreferencesStore.setState({
+             isStackedMonthlyView: true,
+             isDailyAgendaView: false
+         });
+         useSchedulerPreferencesStore.getState().setIsStackedMonthlyView(false);
+-        expect(
+-            useSchedulerPreferencesStore.getState().isDailyAgendaView
+-        ).toBe(false);
++        expect(useSchedulerPreferencesStore.getState().isDailyAgendaView).toBe(
++            false
++        );
+     });
+ });
+ 
+ /* ------------------------------------------------------------------ */
+ /* setIsDailyAgendaView                                                */
+ /* ------------------------------------------------------------------ */
+ 
+ describe('useSchedulerPreferencesStore — setIsDailyAgendaView', () => {
+     it('sets isDailyAgendaView to true', () => {
+         useSchedulerPreferencesStore.getState().setIsDailyAgendaView(true);
+-        expect(
+-            useSchedulerPreferencesStore.getState().isDailyAgendaView
+-        ).toBe(true);
++        expect(useSchedulerPreferencesStore.getState().isDailyAgendaView).toBe(
++            true
++        );
+     });
+ 
+     it('sets isDailyAgendaView to false', () => {
+         useSchedulerPreferencesStore.setState({ isDailyAgendaView: true });
+         useSchedulerPreferencesStore.getState().setIsDailyAgendaView(false);
+-        expect(
+-            useSchedulerPreferencesStore.getState().isDailyAgendaView
+-        ).toBe(false);
++        expect(useSchedulerPreferencesStore.getState().isDailyAgendaView).toBe(
++            false
++        );
+     });
+ 
+     it('turns off isStackedMonthlyView when enabled (mutually exclusive layouts)', () => {
+         useSchedulerPreferencesStore.setState({ isStackedMonthlyView: true });
+         useSchedulerPreferencesStore.getState().setIsDailyAgendaView(true);
+         const state = useSchedulerPreferencesStore.getState();
+         expect(state.isDailyAgendaView).toBe(true);
+         expect(state.isStackedMonthlyView).toBe(false);
+     });
+ 
+     it('does not disturb isStackedMonthlyView when disabled', () => {
+         useSchedulerPreferencesStore.setState({
+             isDailyAgendaView: true,
+             isStackedMonthlyView: false
+         });
+         useSchedulerPreferencesStore.getState().setIsDailyAgendaView(false);
+         expect(
+             useSchedulerPreferencesStore.getState().isStackedMonthlyView
+         ).toBe(false);
+     });
+ });
+ 
+ /* ------------------------------------------------------------------ */
+ /* setStackedMonthCount                                                */
+ /* ------------------------------------------------------------------ */
+ 
+ describe('useSchedulerPreferencesStore — setStackedMonthCount', () => {
+     it('sets a value within the valid range', () => {
+         useSchedulerPreferencesStore.getState().setStackedMonthCount(7);
+-        expect(
+-            useSchedulerPreferencesStore.getState().stackedMonthCount
+-        ).toBe(7);
++        expect(useSchedulerPreferencesStore.getState().stackedMonthCount).toBe(
++            7
++        );
+     });
+ 
+     it('accepts the boundary minimum of 2', () => {
+         useSchedulerPreferencesStore.getState().setStackedMonthCount(2);
+-        expect(
+-            useSchedulerPreferencesStore.getState().stackedMonthCount
+-        ).toBe(2);
++        expect(useSchedulerPreferencesStore.getState().stackedMonthCount).toBe(
++            2
++        );
+     });
+ 
+     it('accepts the boundary maximum of 12', () => {
+         useSchedulerPreferencesStore.getState().setStackedMonthCount(12);
+-        expect(
+-            useSchedulerPreferencesStore.getState().stackedMonthCount
+-        ).toBe(12);
++        expect(useSchedulerPreferencesStore.getState().stackedMonthCount).toBe(
++            12
++        );
+     });
+ 
+     it('clamps values below 2 to the minimum of 2', () => {
+         useSchedulerPreferencesStore.getState().setStackedMonthCount(0);
+-        expect(
+-            useSchedulerPreferencesStore.getState().stackedMonthCount
+-        ).toBe(2);
++        expect(useSchedulerPreferencesStore.getState().stackedMonthCount).toBe(
++            2
++        );
+     });
+ 
+     it('clamps values above 12 to the maximum of 12', () => {
+         useSchedulerPreferencesStore.getState().setStackedMonthCount(20);
+-        expect(
+-            useSchedulerPreferencesStore.getState().stackedMonthCount
+-        ).toBe(12);
++        expect(useSchedulerPreferencesStore.getState().stackedMonthCount).toBe(
++            12
++        );
+     });
+ });
+ 
+ /* ------------------------------------------------------------------ */
+ /* setSearchQuery                                                      */
+ /* ------------------------------------------------------------------ */
+ 
+ describe('useSchedulerPreferencesStore — setSearchQuery', () => {
+     it('defaults to an empty string', () => {
+         expect(useSchedulerPreferencesStore.getState().searchQuery).toBe('');
+     });
+ 
+     it('sets the search query', () => {
+         useSchedulerPreferencesStore.getState().setSearchQuery('Board Meeting');
+         expect(useSchedulerPreferencesStore.getState().searchQuery).toBe(
+             'Board Meeting'
+         );
+     });
+ 
+     it('clears the search query when set to an empty string', () => {
+         useSchedulerPreferencesStore.setState({ searchQuery: 'Retro' });
+         useSchedulerPreferencesStore.getState().setSearchQuery('');
+         expect(useSchedulerPreferencesStore.getState().searchQuery).toBe('');
+     });
+ });
+diff --git a/frontend/src/types/eventDetails.ts b/frontend/src/types/eventDetails.ts
+index 9fd9c3a..9062953 100644
+--- a/frontend/src/types/eventDetails.ts
++++ b/frontend/src/types/eventDetails.ts
+@@ -1,26 +1,28 @@
+ import type { ApiRecord } from './models';
+ 
+ export interface EventDetail {
+     id: string;
+     name: string;
+     sourceName: string;
+     startDtime?: string | null;
+     endDtime?: string | null;
+     description?: string | null;
+     url?: string | null;
+     isAllDay: boolean;
+     resourceId?: string | null;
+     properties?: ApiRecord | null;
+ }
+ 
+ export interface EventProperties {
+     directorate?: string;
+     fAllDayEvent?: boolean;
+     fRecurrence?: boolean;
+ }
+ 
+ export interface EventDetailsQuery {
+     sourceIds: string[];
+     start?: string;
+     end?: string;
++    /** Bypass the server's cached events and re-query the providers. */
++    refresh?: boolean;
+ }

@@ -1,0 +1,13 @@
+Repository: /c/Users/TurnerAdam/Documents/Projects/cloned/slate-react/slate-react
+Repository name: slate-react
+Feature branch: refreshEventsCache
+Target branch: origin/main
+Feature commit: 95e06373217badf8161f48ade6ead7943229091b
+Target commit: c70b1a9f1ff07eacc392c02371876acdc295414d
+Merge base: 6dffc9a67f745e65a3c96008bd3ef3f40e35c53d
+Comparison: origin/main...HEAD
+Generated: 2026-11-20 14:25:15 +0100
+
+Uncommitted working-tree changes are excluded.
+Project context: /c/Users/TurnerAdam/Documents/Projects/PR-Review-Output/slate-react/_project/project-context.md
+Line map: line-map.txt (new-side line numbers refer to feature branch HEAD)
